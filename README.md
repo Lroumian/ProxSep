@@ -1,19 +1,129 @@
 # ProxSep
 
-独立开发的 Rust Windows 代理路由器。目标是功能与行为兼容；当前不是完整 1:1，也不是像素级界面复制。不复用第三方源码、图标或品牌资源。
+<p align="center">
+  <strong>A Rust-native Windows proxy router and traffic policy engine for developers, reverse engineers, and power users.</strong>
+</p>
 
-目前具备：
+<p align="center">
+  Program-level routing · SOCKS/HTTP proxying · rule debugging · DNS correlation · Windows Service · WFP driver
+</p>
 
-- PPX v100–102 导入/回写，嵌套认证、代理链、DNS/接口配置；保留未知节点，规则重命名/重排不丢扩展字段；
-- 有序规则与 Default 回退，应用路径/文件名/PID、目标通配符/IPv4 CIDR/双栈地址段、端口段、指定接口；
-- SOCKS4/4A/5、HTTP CONNECT、Basic 与 Windows SSPI NTLM/Negotiate，串行链、冗余、随机负载均衡/PID 黏性；
-- 动态 SOCKS5 入口、独立 DNS 入口与稳定127.8假地址、连接日志/流量计数、配置热更新；
-- 原生桌面编辑器、代理检查、Windows 服务/控制台守护进程；
-- 可构建的独立 Rust WDM/WFP 驱动，以及读取 WFP 目标/身份/records 的双栈透明 TCP 入口。
+<p align="center">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2024-orange?logo=rust">
+  <img alt="Platform" src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows">
+  <img alt="License" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue">
+  <img alt="Status" src="https://img.shields.io/badge/status-experimental-yellow">
+</p>
 
-关键未完成项：内核 DNS datagram 捕获/注入及全系统 DNS 衔接、UDP 策略、HTTP-only 请求转发、受保护 PPX 凭据解密/生成、完整后台健康检查、手动启动覆盖、服务/其他用户/泄漏防护策略、系统级对照验证。驱动尚未签名、安装或加载；编译成功不等于透明代理已可部署。
+---
 
-## 构建与验证
+> [!WARNING]
+> ProxSep is under active development. The WFP driver builds, but is not yet signed, installed, or considered deployment-ready. Do not treat a successful build as proof that transparent proxying is production-safe.
+
+## Why ProxSep?
+
+ProxSep is not intended to be a pixel-for-pixel clone of another product. It is an independent Rust implementation focused on **programmable routing, observability, and transparent Windows networking**.
+
+The long-term goal is to make it easy to answer:
+
+- Which process created this connection?
+- Which rule matched, and why?
+- Where is this traffic being routed?
+- Which DNS resolution produced this destination?
+- Can the route be changed without restarting the application?
+- Can the same routing engine be controlled from a desktop UI, CLI, service, or API?
+
+Packet inspection is intentionally out of scope for the core project. Dedicated packet-analysis tooling can integrate with ProxSep later.
+
+## Current capabilities
+
+### Routing & rules
+
+- Ordered rules with a Default fallback.
+- Match by executable path, filename, PID, destination, IPv4 CIDR, dual-stack ranges, port ranges, and interface.
+- Hot configuration reload.
+- Direct / proxy routing primitives.
+- Transparent TCP routing path backed by WFP context and records.
+
+### Proxy protocols
+
+- SOCKS4 / SOCKS4A / SOCKS5.
+- HTTP CONNECT.
+- HTTP Basic authentication.
+- Windows SSPI NTLM / Negotiate.
+- Serial proxy chains.
+- Redundancy / failover.
+- Random load balancing with PID stickiness.
+
+### DNS & identity
+
+- Dedicated DNS listener.
+- Stable `127.8.0.0/16` fake-address mapping.
+- Windows TCP-table process attribution for the local SOCKS entry.
+- WFP-provided target and identity data for transparent connections.
+
+### Tooling
+
+- Native desktop profile editor.
+- CLI for validation, rule evaluation, serving, and transparent mode.
+- Windows Service / console daemon.
+- Connection logging and byte counters.
+- Proxy connectivity checks.
+- PPX v100–102 import/write support, including nested authentication, chains, DNS/interface configuration, and preservation of unknown extension fields.
+
+## Not finished yet
+
+The following areas are intentionally tracked as incomplete:
+
+- Kernel DNS datagram capture/injection and full system-DNS integration.
+- UDP policy and routing.
+- HTTP-only request forwarding.
+- Protected PPX credential decrypt/generation.
+- Continuous background health checks.
+- Manual startup overrides.
+- Service / other-user / leak-prevention policy.
+- System-level behavioral validation.
+- Signed and packaged WFP driver deployment.
+
+## Architecture
+
+```text
+Desktop UI ─┐
+CLI        ──┼────> ProxSep Core / Rule Engine
+Service    ──┘               │
+                              ├── Proxy protocols
+                              ├── DNS tracker
+                              ├── Runtime / flow manager
+                              └── Windows platform layer
+                                         │
+                                         └── WFP driver
+```
+
+Workspace layout:
+
+```text
+crates/
+  proxsep-core       configuration, rules, DNS
+  proxsep-protocol   proxy protocols and SSPI
+  proxsep-runtime    routing, listeners, Windows queries
+  proxsep-driver     user-mode driver protocol
+  proxsep-desktop    native desktop UI
+  proxsep-service    Windows Service / daemon
+  proxsep-cli        command-line interface
+
+drivers/
+  proxsep-wfp        independent Rust WDM/WFP driver
+```
+
+## Build
+
+Requirements:
+
+- Rust toolchain with Edition 2024 support.
+- Windows.
+- WDK only when building the kernel driver.
+
+Validation:
 
 ```powershell
 cargo fmt --all -- --check
@@ -24,23 +134,107 @@ cargo build --workspace --release
 .\scripts\build-driver.ps1
 ```
 
-内核驱动是独立workspace，使用已有WDK。构建脚本不安装驱动，不更改测试签名或安全启动状态。
+The driver build script **does not** install the driver or modify test-signing / Secure Boot settings.
 
-## 使用
+## Usage
+
+Open a profile in the desktop editor:
 
 ```powershell
 cargo run -p proxsep-desktop -- 'C:\Profiles\Profile.ppx'
+```
+
+Validate a profile:
+
+```powershell
 cargo run -p proxsep-cli -- check-profile 'C:\Profiles\Profile.ppx'
+```
+
+Evaluate a route:
+
+```powershell
 cargo run -p proxsep-cli -- route 'C:\Profiles\Profile.ppx' --app app.exe --host example.com --port 443
+```
+
+Start the local proxy entry:
+
+```powershell
 cargo run -p proxsep-cli -- serve 'C:\Profiles\Profile.ppx' --listen 127.0.0.1:1081
-# 可选DNS入口；不会修改系统DNS
+```
+
+Optional DNS listener:
+
+```powershell
 cargo run -p proxsep-cli -- serve 'C:\Profiles\Profile.ppx' --dns-listen 127.0.0.1:5353 --dns-upstream 127.0.0.1:53
-# 仅当用户已部署我们的独立签名驱动时使用，不会打开原Proxifier驱动
+```
+
+Transparent mode, only after deploying the ProxSep driver yourself:
+
+```powershell
 cargo run -p proxsep-cli -- transparent 'C:\Profiles\Profile.ppx'
 ```
 
-本地SOCKS入口默认尝试Windows TCP表识别真实PID/应用；显式传入的 `--app` 是人为标签，不是可靠内核身份。透明入口只接受有WFP context/records的套接字，不允许普通连接自报目标/身份。接口/归属查询是快照，存在进程退出竞态。
+The local SOCKS entry attempts to identify the real PID/application from Windows TCP tables. An explicit `--app` value is only a user-supplied label and is not trusted kernel identity.
 
-## 工程结构
+The transparent listener only accepts sockets backed by ProxSep WFP context/records; ordinary connections cannot self-declare their target or identity.
 
-`core` 配置/规则/DNS，`protocol` 代理协议/SSPI，`runtime` 路由/监听/Windows查询，`driver` 控制编解码，`desktop` 原生界面，`service` SCM/守护进程，`cli` 命令行。独立驱动在 `drivers/proxsep-wfp`。
+## Roadmap
+
+### v0.1 — Foundation
+
+- [x] Rust workspace.
+- [x] PPX parsing/writing.
+- [x] Ordered rule engine.
+- [x] SOCKS4/4A/5.
+- [x] HTTP CONNECT.
+- [x] Proxy chains, failover, and load balancing.
+- [x] Desktop editor.
+- [x] CLI and Windows Service.
+- [x] Experimental WFP driver path.
+
+### v0.2 — Observable routing
+
+- [ ] Rule decision trace: explain exactly why a rule matched.
+- [ ] Process tree and richer process identity.
+- [ ] DNS-to-flow correlation.
+- [ ] Connection timeline.
+- [ ] Improved proxy health metrics.
+- [ ] Rule creation from live connections.
+
+### v0.3 — UDP & automation
+
+- [ ] UDP routing model.
+- [ ] QUIC-aware flow metadata.
+- [ ] REST API.
+- [ ] WebSocket event stream.
+- [ ] Dynamic policy and failover conditions.
+- [ ] Scriptable / machine-readable rule diagnostics.
+
+### Later
+
+- [ ] Separate packet-analysis companion.
+- [ ] Flow-to-PCAP handoff.
+- [ ] Plugin / extension API.
+- [ ] Signed driver packaging and installer.
+
+## Clean-room / compatibility policy
+
+ProxSep is independently developed.
+
+The project does **not** reuse proprietary source code, icons, branding, or private assets from third-party products. Compatibility work should be based on public behavior, public formats, and independently observed interoperability requirements.
+
+"ProxSep" is its own project and is not affiliated with Proxifier or Initex.
+
+## Contributing
+
+Issues, implementation discussions, documentation fixes, and focused pull requests are welcome.
+
+Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md). Security-sensitive findings should follow [SECURITY.md](SECURITY.md) instead of being opened publicly.
+
+## License
+
+ProxSep is licensed under **GPL-3.0-or-later**.
+
+You may use, modify, redistribute, and sell copies of the software. If you distribute a modified version based on GPL-covered ProxSep code, the corresponding source must remain available under the GPL terms.
+
+See [LICENSE](LICENSE) for the complete license text.
