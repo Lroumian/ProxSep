@@ -1,6 +1,10 @@
 # ProxSep
 
 <p align="center">
+  <strong>English</strong> | <a href="./README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
   <strong>A Rust-native Windows proxy router and traffic policy engine for developers, reverse engineers, and power users.</strong>
 </p>
 
