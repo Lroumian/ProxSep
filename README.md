@@ -45,6 +45,7 @@ Packet inspection is intentionally out of scope for the core project. Dedicated 
 
 - Ordered rules with a Default fallback.
 - Match by executable path, filename, PID, destination, IPv4 CIDR, dual-stack ranges, port ranges, and interface.
+- Rule decision traces with per-condition expected/actual evidence in the desktop diagnostics and CLI.
 - Hot configuration reload.
 - Direct / proxy routing primitives.
 - Transparent TCP routing path backed by WFP context and records.
@@ -160,6 +161,12 @@ Evaluate a route:
 cargo run -p proxsep-cli -- route 'C:\Profiles\Profile.ppx' --app app.exe --host example.com --port 443
 ```
 
+Explain every evaluated rule and condition, with optional process, DNS, and interface context:
+
+```powershell
+cargo run -p proxsep-cli -- route 'C:\Profiles\Profile.ppx' --app Wardogs.exe --host api.example.com --port 443 --pid 8432 --resolved-ip 34.120.1.8 --interface Ethernet --interface-ip 192.0.2.10 --trace
+```
+
 Start the local proxy entry:
 
 ```powershell
@@ -198,7 +205,7 @@ The transparent listener only accepts sockets backed by ProxSep WFP context/reco
 
 ### v0.2 — Observable routing
 
-- [ ] Rule decision trace: explain exactly why a rule matched.
+- [x] Rule decision trace: explain exactly why a rule matched.
 - [ ] Process tree and richer process identity.
 - [ ] DNS-to-flow correlation.
 - [ ] Connection timeline.

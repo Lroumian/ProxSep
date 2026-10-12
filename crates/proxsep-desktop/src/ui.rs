@@ -7,9 +7,9 @@ use std::{
 use eframe::egui::{self, Color32, ComboBox, DragValue, RichText, ScrollArea, TextEdit};
 use proxsep_core::{
     profile::{Action, Chain, CredentialState, Profile, Proxy, Rule},
-    rules::{Connection, RuleEngine},
+    rules::{Connection, RuleEngine, RuleTraceOutcome},
 };
-use proxsep_desktop::{ProfileEditor, window_title};
+use proxsep_desktop::{DiagnosticContextInput, ProfileEditor, window_title};
 use proxsep_runtime::{ListenerHandle, Runtime};
 
 const DEFAULT_PROFILE: &str = include_str!("../../proxsep-core/tests/fixtures/default.ppx");
@@ -48,6 +48,7 @@ pub struct DesktopApp {
     application: String,
     target: String,
     port: u16,
+    diagnostic_context: DiagnosticContextInput,
     check_result: String,
     check_rx: Option<mpsc::Receiver<String>>,
     async_runtime: tokio::runtime::Runtime,
@@ -92,6 +93,7 @@ impl DesktopApp {
             application: "browser.exe".into(),
             target: "example.com".into(),
             port: 443,
+            diagnostic_context: DiagnosticContextInput::default(),
             check_result: String::new(),
             check_rx: None,
             async_runtime: tokio::runtime::Runtime::new().expect("network runtime"),
@@ -883,13 +885,75 @@ impl DesktopApp {
             ui.label("Port");
             ui.add(DragValue::new(&mut self.port).range(1..=65535));
             ui.end_row();
+            ui.label("PID (optional)");
+            ui.text_edit_singleline(&mut self.diagnostic_context.pid);
+            ui.end_row();
+            ui.label("Resolved IPs");
+            ui.text_edit_singleline(&mut self.diagnostic_context.resolved_ips);
+            ui.end_row();
+            ui.label("Interface name");
+            ui.text_edit_singleline(&mut self.diagnostic_context.interface_name);
+            ui.end_row();
+            ui.label("Interface IPs");
+            ui.text_edit_singleline(&mut self.diagnostic_context.interface_ips);
+            ui.end_row();
         });
-        let connection = Connection::new(&self.application, &self.target, self.port);
-        let decision = RuleEngine::new(&self.editor.profile.rules).decide(&connection);
+        let mut connection = Connection::new(&self.application, &self.target, self.port);
+        if let Err(error) = self.diagnostic_context.apply_to(&mut connection) {
+            ui.separator();
+            ui.colored_label(Color32::from_rgb(180, 45, 45), error);
+            return;
+        }
+        let trace = RuleEngine::new(&self.editor.profile.rules).trace(&connection);
         ui.separator();
-        ui.label(format!("Static rule preview: {}", decision.rule_name));
+        ui.label(format!("Static rule preview: {}", trace.decision.rule_name));
         ui.label("Live testing includes runtime DNS and interface context.");
-        ui.label(format!("Route: {:?}", decision.action));
+        ui.label(format!("Route: {:?}", trace.decision.action));
+        ui.separator();
+        ui.strong("Rule decision trace");
+        ScrollArea::vertical()
+            .id_salt("rule_decision_trace")
+            .max_height(360.0)
+            .show(ui, |ui| {
+                for rule in &trace.rules {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(format!("Rule #{} {}", rule.index + 1, rule.rule_name));
+                            let color = match rule.outcome {
+                                RuleTraceOutcome::Matched | RuleTraceOutcome::DefaultFallback => {
+                                    Color32::from_rgb(20, 130, 60)
+                                }
+                                RuleTraceOutcome::NotMatched => Color32::from_rgb(180, 45, 45),
+                                _ => Color32::GRAY,
+                            };
+                            ui.colored_label(color, rule.outcome.label());
+                        });
+                        for condition in &rule.conditions {
+                            let marker = if condition.matched { "✓" } else { "✗" };
+                            let result = if condition.matched {
+                                "matched"
+                            } else {
+                                "mismatch"
+                            };
+                            let color = if condition.matched {
+                                Color32::from_rgb(20, 130, 60)
+                            } else {
+                                Color32::from_rgb(180, 45, 45)
+                            };
+                            ui.colored_label(
+                                color,
+                                format!("{marker} {} {result}", condition.kind.label()),
+                            );
+                            if !condition.matched {
+                                ui.indent((rule.index, condition.kind.label()), |ui| {
+                                    ui.label(format!("Expected: {}", condition.expected));
+                                    ui.label(format!("Actual: {}", condition.actual));
+                                });
+                            }
+                        }
+                    });
+                }
+            });
         if ui.button("Test live profile route").clicked() {
             self.run_check(self.editor.profile.clone(), connection);
         }

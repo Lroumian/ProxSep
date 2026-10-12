@@ -1,4 +1,55 @@
 use proxsep_core::profile::{Action, CredentialState, Profile};
+use proxsep_core::rules::Connection;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiagnosticContextInput {
+    pub pid: String,
+    pub resolved_ips: String,
+    pub interface_name: String,
+    pub interface_ips: String,
+}
+
+impl DiagnosticContextInput {
+    pub fn apply_to(&self, connection: &mut Connection) -> Result<(), String> {
+        let pid = if self.pid.trim().is_empty() {
+            None
+        } else {
+            Some(
+                self.pid
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("Invalid PID: {}", self.pid.trim()))?,
+            )
+        };
+        let resolved_ips = parse_ip_list("resolved IP", &self.resolved_ips)?;
+        let interface_ips = parse_ip_list("interface IP", &self.interface_ips)?;
+        let interface_name = self.interface_name.trim();
+        if interface_name.is_empty() && !interface_ips.is_empty() {
+            return Err("Interface IPs require an interface name".into());
+        }
+
+        connection.pid = pid;
+        connection.resolved_ips = resolved_ips;
+        connection.interfaces.clear();
+        if !interface_name.is_empty() {
+            connection
+                .interfaces
+                .insert(interface_name.into(), interface_ips);
+        }
+        Ok(())
+    }
+}
+
+fn parse_ip_list(label: &str, value: &str) -> Result<Vec<std::net::IpAddr>, String> {
+    value
+        .split(|character: char| character == ',' || character == ';' || character.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<std::net::IpAddr>()
+                .map_err(|_| format!("Invalid {label}: {part}"))
+        })
+        .collect()
+}
 
 pub fn window_title(profile_name: &str, dirty: bool) -> String {
     format!(
@@ -303,6 +354,29 @@ mod tests {
             proxsep_core::profile::CredentialState::Plaintext
         );
         assert!(editor.dirty);
+    }
+
+    #[test]
+    fn diagnostic_context_populates_pid_dns_and_interface_evidence() {
+        let context = DiagnosticContextInput {
+            pid: "8432".into(),
+            resolved_ips: "34.120.1.8; 2001:db8::8".into(),
+            interface_name: "Ethernet".into(),
+            interface_ips: "192.0.2.10, 2001:db8::10".into(),
+        };
+        let mut connection =
+            proxsep_core::rules::Connection::new("Wardogs.exe", "api.example.com", 443);
+
+        context.apply_to(&mut connection).unwrap();
+        assert_eq!(connection.pid, Some(8432));
+        assert_eq!(connection.resolved_ips.len(), 2);
+        assert_eq!(connection.interfaces["Ethernet"].len(), 2);
+
+        let invalid = DiagnosticContextInput {
+            resolved_ips: "not-an-ip".into(),
+            ..Default::default()
+        };
+        assert!(invalid.apply_to(&mut connection).is_err());
     }
 
     #[cfg(windows)]

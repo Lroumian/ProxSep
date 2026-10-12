@@ -55,6 +55,7 @@ ProxSep 不是为了逐像素复刻其他产品，而是一个独立实现的 Ru
 
 - 有序规则匹配与 Default 回退。
 - 支持按程序路径、文件名、PID、目标地址、IPv4 CIDR、双栈地址范围、端口范围、指定接口匹配。
+- 桌面诊断与 CLI 支持逐条件 Rule Decision Trace，并显示 expected/actual 证据。
 - 配置热更新。
 - Direct / Proxy 路由基础能力。
 - 基于 WFP 上下文与记录的透明 TCP 路由路径。
@@ -172,6 +173,12 @@ cargo run -p proxsep-cli -- check-profile 'C:\Profiles\Profile.ppx'
 cargo run -p proxsep-cli -- route 'C:\Profiles\Profile.ppx' --app app.exe --host example.com --port 443
 ```
 
+输出所有已评估规则和条件，并提供可选的进程、DNS 与接口上下文：
+
+```powershell
+cargo run -p proxsep-cli -- route 'C:\Profiles\Profile.ppx' --app Wardogs.exe --host api.example.com --port 443 --pid 8432 --resolved-ip 34.120.1.8 --interface Ethernet --interface-ip 192.0.2.10 --trace
+```
+
 启动本地代理入口：
 
 ```powershell
@@ -210,7 +217,7 @@ cargo run -p proxsep-cli -- transparent 'C:\Profiles\Profile.ppx'
 
 ### v0.2 — 可观测路由
 
-- [ ] Rule Decision Trace：解释规则为什么命中
+- [x] Rule Decision Trace：解释规则为什么命中
 - [ ] Process Tree 与更完整的进程身份
 - [ ] DNS → Flow 关联
 - [ ] 连接时间线

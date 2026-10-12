@@ -73,6 +73,20 @@ enum Command {
         host: String,
         #[arg(long)]
         port: u16,
+        #[arg(long)]
+        pid: Option<u32>,
+        /// Resolved destination addresses available to IP/CIDR rules.
+        #[arg(long = "resolved-ip")]
+        resolved_ips: Vec<std::net::IpAddr>,
+        /// Network interface name or identifier used by interface-aware rules.
+        #[arg(long)]
+        interface: Option<String>,
+        /// Active address for --interface; repeat for multiple addresses.
+        #[arg(long = "interface-ip", requires = "interface")]
+        interface_ips: Vec<std::net::IpAddr>,
+        /// Print every evaluated rule and condition.
+        #[arg(long)]
+        trace: bool,
     },
     Tunnel {
         #[arg(long, default_value = "127.0.0.1:1081")]
@@ -94,12 +108,59 @@ enum Command {
 
 #[cfg(test)]
 mod branding_tests {
-    use super::Cli;
-    use clap::CommandFactory;
+    use super::{Cli, Command};
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn command_name_is_proxsep() {
         assert_eq!(Cli::command().get_name(), "proxsep");
+    }
+
+    #[test]
+    fn route_accepts_an_explicit_decision_trace_flag() {
+        let cli = Cli::try_parse_from([
+            "proxsep",
+            "route",
+            "profile.ppx",
+            "--app",
+            "app.exe",
+            "--host",
+            "example.com",
+            "--port",
+            "443",
+            "--pid",
+            "8432",
+            "--resolved-ip",
+            "34.120.1.8",
+            "--interface",
+            "Ethernet",
+            "--interface-ip",
+            "192.0.2.10",
+            "--trace",
+        ])
+        .unwrap();
+        let Command::Route {
+            trace,
+            pid,
+            resolved_ips,
+            interface,
+            interface_ips,
+            ..
+        } = cli.command
+        else {
+            panic!("expected route command");
+        };
+        assert!(trace);
+        assert_eq!(pid, Some(8432));
+        assert_eq!(
+            resolved_ips,
+            vec!["34.120.1.8".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(interface.as_deref(), Some("Ethernet"));
+        assert_eq!(
+            interface_ips,
+            vec!["192.0.2.10".parse::<std::net::IpAddr>().unwrap()]
+        );
     }
 }
 
@@ -249,11 +310,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             app,
             host,
             port,
+            pid,
+            resolved_ips,
+            interface,
+            interface_ips,
+            trace,
         } => {
             let profile = load_profile(&profile)?;
-            let connection = Connection::new(app, host, port);
-            let decision = RuleEngine::new(&profile.rules).decide(&connection);
-            println!("{}: {:?}", decision.rule_name, decision.action);
+            let mut connection = Connection::new(app, host, port);
+            connection.pid = pid;
+            connection.resolved_ips = resolved_ips;
+            if let Some(interface) = interface {
+                connection.interfaces.insert(interface, interface_ips);
+            }
+            let engine = RuleEngine::new(&profile.rules);
+            if trace {
+                print!("{}", engine.trace(&connection).render_text(&connection));
+            } else {
+                let decision = engine.decide(&connection);
+                println!("{}: {:?}", decision.rule_name, decision.action);
+            }
         }
         Command::Tunnel {
             listen,

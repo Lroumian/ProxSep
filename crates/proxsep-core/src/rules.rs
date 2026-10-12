@@ -41,6 +41,141 @@ pub struct Decision<'a> {
     pub interface_id: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionKind {
+    Application,
+    Target,
+    Port,
+    Interface,
+}
+
+impl ConditionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Application => "Application",
+            Self::Target => "Target",
+            Self::Port => "Port",
+            Self::Interface => "Interface",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConditionTrace {
+    pub kind: ConditionKind,
+    pub matched: bool,
+    pub expected: String,
+    pub actual: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleTraceOutcome {
+    Disabled,
+    DeferredDefault,
+    NotEvaluated,
+    NotMatched,
+    Matched,
+    DefaultFallback,
+}
+
+impl RuleTraceOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::DeferredDefault => "default deferred while custom rules are evaluated",
+            Self::NotEvaluated => "not evaluated after an earlier match",
+            Self::NotMatched => "not matched",
+            Self::Matched => "matched",
+            Self::DefaultFallback => "default fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleTrace {
+    pub index: usize,
+    pub rule_name: String,
+    pub outcome: RuleTraceOutcome,
+    pub conditions: Vec<ConditionTrace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionTrace<'a> {
+    pub decision: Decision<'a>,
+    pub rules: Vec<RuleTrace>,
+}
+
+impl DecisionTrace<'_> {
+    pub fn render_text(&self, connection: &Connection) -> String {
+        use std::fmt::Write as _;
+
+        let mut output = String::new();
+        let _ = writeln!(output, "Connection");
+        let _ = writeln!(output, "Process: {}", connection.application);
+        if let Some(pid) = connection.pid {
+            let _ = writeln!(output, "PID: {pid}");
+        }
+        let _ = writeln!(output, "Target: {}", connection.target);
+        if !connection.resolved_ips.is_empty() {
+            let addresses = connection
+                .resolved_ips
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(output, "IP: {addresses}");
+        }
+        let _ = writeln!(output, "Port: {}", connection.port);
+        let mut interfaces = connection
+            .interfaces
+            .iter()
+            .filter(|(_, addresses)| !addresses.is_empty())
+            .map(|(name, addresses)| {
+                format!(
+                    "{} ({})",
+                    name,
+                    addresses
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect::<Vec<_>>();
+        interfaces.sort_unstable();
+        if !interfaces.is_empty() {
+            let _ = writeln!(output, "Interface: {}", interfaces.join(", "));
+        }
+        let _ = writeln!(output, "\nEvaluation:\n");
+        for rule in &self.rules {
+            let _ = writeln!(output, "Rule #{} {}", rule.index + 1, rule.rule_name);
+            match rule.outcome {
+                RuleTraceOutcome::Matched => {
+                    for condition in &rule.conditions {
+                        render_condition(&mut output, condition);
+                    }
+                    let _ = writeln!(output, "\n=> MATCHED\n");
+                }
+                RuleTraceOutcome::NotMatched => {
+                    for condition in &rule.conditions {
+                        render_condition(&mut output, condition);
+                    }
+                    let _ = writeln!(output);
+                }
+                RuleTraceOutcome::DefaultFallback => {
+                    let _ = writeln!(output, "  ✓ Default fallback\n\n=> MATCHED\n");
+                }
+                outcome => {
+                    let _ = writeln!(output, "  - {}\n", outcome.label());
+                }
+            }
+        }
+        let _ = writeln!(output, "Action:");
+        let _ = writeln!(output, "{}", action_label(self.decision.action));
+        output
+    }
+}
+
 pub struct RuleEngine<'a> {
     rules: &'a [Rule],
 }
@@ -59,20 +194,65 @@ impl<'a> RuleEngine<'a> {
                     .iter()
                     .find(|rule| rule.enabled && rule.name == "Default")
             })
-            .map(|rule| Decision {
-                rule_name: &rule.name,
-                action: &rule.action,
-                interface_id: connection
-                    .interfaces
-                    .get(&rule.interface_id)
-                    .filter(|ips| !ips.is_empty())
-                    .map(|_| rule.interface_id.as_str()),
-            })
+            .map(|rule| decision_for(rule, connection))
             .unwrap_or(Decision {
                 rule_name: "<implicit direct>",
                 action: &IMPLICIT_DIRECT,
                 interface_id: None,
             })
+    }
+
+    /// Explain the same ordered decision made by [`Self::decide`] without
+    /// adding allocations to the normal routing path.
+    pub fn trace(&self, connection: &Connection) -> DecisionTrace<'a> {
+        let mut traces = Vec::with_capacity(self.rules.len());
+        let mut matched = None;
+        for (index, rule) in self.rules.iter().enumerate() {
+            let (outcome, conditions) = if matched.is_some() {
+                (RuleTraceOutcome::NotEvaluated, Vec::new())
+            } else if !rule.enabled {
+                (RuleTraceOutcome::Disabled, Vec::new())
+            } else if rule.name == "Default" {
+                (RuleTraceOutcome::DeferredDefault, Vec::new())
+            } else {
+                let conditions = trace_conditions(rule, connection);
+                if conditions.iter().all(|condition| condition.matched) {
+                    matched = Some(rule);
+                    (RuleTraceOutcome::Matched, conditions)
+                } else {
+                    (RuleTraceOutcome::NotMatched, conditions)
+                }
+            };
+            traces.push(RuleTrace {
+                index,
+                rule_name: rule.name.clone(),
+                outcome,
+                conditions,
+            });
+        }
+
+        if matched.is_none()
+            && let Some(default_index) = self
+                .rules
+                .iter()
+                .position(|rule| rule.enabled && rule.name == "Default")
+        {
+            matched = Some(&self.rules[default_index]);
+            traces[default_index].outcome = RuleTraceOutcome::DefaultFallback;
+        }
+
+        let decision = matched.map_or(
+            Decision {
+                rule_name: "<implicit direct>",
+                action: &IMPLICIT_DIRECT,
+                interface_id: None,
+            },
+            |rule| decision_for(rule, connection),
+        );
+        DecisionTrace {
+            decision,
+            rules: traces,
+        }
     }
 
     /// Resolve a decision only when earlier rules cannot change after DNS.
@@ -108,6 +288,129 @@ impl<'a> RuleEngine<'a> {
         }
         // No target-DNS-dependent earlier rule remains; fallback is definitive.
         Some(self.decide(connection))
+    }
+}
+
+fn decision_for<'a>(rule: &'a Rule, connection: &Connection) -> Decision<'a> {
+    Decision {
+        rule_name: &rule.name,
+        action: &rule.action,
+        interface_id: connection
+            .interfaces
+            .get(&rule.interface_id)
+            .filter(|ips| !ips.is_empty())
+            .map(|_| rule.interface_id.as_str()),
+    }
+}
+
+fn trace_conditions(rule: &Rule, connection: &Connection) -> Vec<ConditionTrace> {
+    let active_interface = connection
+        .interfaces
+        .get(&rule.interface_id)
+        .filter(|addresses| !addresses.is_empty());
+    let interface_required = rule.skip_if_interface_down && !rule.interface_id.is_empty();
+    vec![
+        ConditionTrace {
+            kind: ConditionKind::Application,
+            matched: matches_application(&rule.applications, connection),
+            expected: pattern_label(&rule.applications),
+            actual: connection.pid.map_or_else(
+                || format!("{} (PID unavailable)", connection.application),
+                |pid| format!("{} (PID {pid})", connection.application),
+            ),
+        },
+        ConditionTrace {
+            kind: ConditionKind::Target,
+            matched: matches_targets(&rule.targets, connection),
+            expected: pattern_label(&rule.targets),
+            actual: target_label(connection),
+        },
+        ConditionTrace {
+            kind: ConditionKind::Port,
+            matched: matches_port_list(&rule.ports, connection.port),
+            expected: pattern_label(&rule.ports),
+            actual: connection.port.to_string(),
+        },
+        ConditionTrace {
+            kind: ConditionKind::Interface,
+            matched: !interface_required || active_interface.is_some(),
+            expected: if rule.interface_id.is_empty() {
+                "*".into()
+            } else if interface_required {
+                format!("{} available", rule.interface_id)
+            } else {
+                format!("{} (availability optional)", rule.interface_id)
+            },
+            actual: active_interface.map_or_else(
+                || {
+                    if rule.interface_id.is_empty() {
+                        "not constrained".into()
+                    } else {
+                        format!("{} unavailable", rule.interface_id)
+                    }
+                },
+                |addresses| {
+                    format!(
+                        "{} available ({})",
+                        rule.interface_id,
+                        addresses
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                },
+            ),
+        },
+    ]
+}
+
+fn pattern_label(value: &str) -> String {
+    if value.trim().is_empty() {
+        "*".into()
+    } else {
+        value.into()
+    }
+}
+
+fn target_label(connection: &Connection) -> String {
+    if connection.resolved_ips.is_empty() {
+        return connection.target.clone();
+    }
+    format!(
+        "{} ({})",
+        connection.target,
+        connection
+            .resolved_ips
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn render_condition(output: &mut String, condition: &ConditionTrace) {
+    use std::fmt::Write as _;
+
+    let marker = if condition.matched { '✓' } else { '✗' };
+    let result = if condition.matched {
+        "matched"
+    } else {
+        "mismatch"
+    };
+    let _ = writeln!(output, "  {marker} {} {result}", condition.kind.label());
+    if !condition.matched {
+        let _ = writeln!(output, "    Expected: {}", condition.expected);
+        let _ = writeln!(output, "    Actual: {}", condition.actual);
+    }
+}
+
+fn action_label(action: &Action) -> String {
+    match action {
+        Action::Direct => "Direct".into(),
+        Action::Block => "Block".into(),
+        Action::Proxy(proxy) => format!("Proxy -> {proxy}"),
+        Action::Chain(chain) => format!("Chain -> {chain}"),
     }
 }
 
