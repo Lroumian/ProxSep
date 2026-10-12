@@ -1,0 +1,10 @@
+[package]
+name = "proxsep-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+base64.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

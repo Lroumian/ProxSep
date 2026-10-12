@@ -1,0 +1,34 @@
+[package]
+name = "proxsep-wfp"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+build = "build.rs"
+
+[workspace]
+members = ["policy"]
+default-members = ["policy"]
+resolver = "2"
+
+[package.metadata.wdk.driver-model]
+driver-type = "WDM"
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+proxsep-wfp-policy = { path = "policy" }
+
+[build-dependencies]
+wdk-build = "=0.5.1"
+bindgen = "0.71"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

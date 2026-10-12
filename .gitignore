@@ -1,0 +1,6 @@
+/target/
+**/target/
+/analysis/
+/docs/
+*.i64
+*.rea-snapshot.json

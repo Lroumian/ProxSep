@@ -1,0 +1,17 @@
+[package]
+name = "proxsep-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "proxsep"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+proxsep-core = { path = "../proxsep-core" }
+proxsep-protocol = { path = "../proxsep-protocol" }
+proxsep-runtime = { path = "../proxsep-runtime" }
+proxsep-driver = { path = "../proxsep-driver" }
+tokio.workspace = true
