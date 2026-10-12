@@ -6,7 +6,7 @@ use std::{
 
 use eframe::egui::{self, Color32, ComboBox, DragValue, RichText, ScrollArea, TextEdit};
 use proxsep_core::{
-    profile::{Action, Chain, Profile, Proxy, Rule},
+    profile::{Action, Chain, CredentialState, Profile, Proxy, Rule},
     rules::{Connection, RuleEngine},
 };
 use proxsep_desktop::{ProfileEditor, window_title};
@@ -17,6 +17,7 @@ const DEFAULT_PROFILE: &str = include_str!("../../proxsep-core/tests/fixtures/de
 fn new_profile() -> Profile {
     let mut profile = Profile::from_xml(DEFAULT_PROFILE).expect("embedded profile");
     profile.options.encryption_mode = "disabled".into();
+    profile.credential_state = CredentialState::Plaintext;
     profile
 }
 
@@ -216,14 +217,16 @@ impl DesktopApp {
 
     fn proxies(&mut self, ui: &mut egui::Ui) {
         ui.heading("Proxy servers");
-        if !["none", "disabled"].iter().any(|mode| {
+        if self.editor.profile.credential_state == CredentialState::AccountUnlocked {
+            ui.label("Credentials are unlocked for this Windows account and will be protected with Windows DPAPI when saved.");
+        } else if !["none", "disabled"].iter().any(|mode| {
             self.editor
                 .profile
                 .options
                 .encryption_mode
                 .eq_ignore_ascii_case(mode)
         }) {
-            ui.label("This profile uses encrypted credential storage. Existing credential values are preserved; the runtime reports unsupported encryption. Use encryption mode 'disabled' for new plaintext credentials.");
+            ui.label("This profile uses an unsupported credential scheme. Existing opaque values are preserved, but cannot be edited or converted without their matching backend.");
         }
         if ui.button("Add proxy").clicked() {
             let proxy = Proxy {
@@ -771,25 +774,30 @@ impl DesktopApp {
                 ui.label("UDP mode");
                 changed |= ui.text_edit_singleline(&mut options.udp_mode).changed();
             });
-            ui.horizontal(|ui| {
-                ui.label("Encryption mode");
-                ComboBox::from_id_salt("credential_encryption")
-                    .selected_text(&options.encryption_mode)
-                    .show_ui(ui, |ui| {
-                        for (mode, label) in [
-                            ("disabled", "Disabled (plaintext)"),
-                            ("basic", "Basic"),
-                            ("account", "Current account"),
-                            ("master", "Master password"),
-                        ] {
-                            changed |= ui
-                                .selectable_value(&mut options.encryption_mode, mode.into(), label)
-                                .changed();
-                        }
-                    });
-            });
         });
         self.editor.dirty |= changed;
+        let current_mode = self.editor.profile.options.encryption_mode.clone();
+        let mut requested_mode = current_mode.clone();
+        ui.horizontal(|ui| {
+            ui.label("Encryption mode");
+            ComboBox::from_id_salt("credential_encryption")
+                .selected_text(&current_mode)
+                .show_ui(ui, |ui| {
+                    for (mode, label) in [
+                        ("disabled", "Disabled (plaintext)"),
+                        ("basic", "Basic"),
+                        ("account", "Current account"),
+                        ("master", "Master password"),
+                    ] {
+                        ui.selectable_value(&mut requested_mode, mode.into(), label);
+                    }
+                });
+        });
+        if requested_mode != current_mode
+            && let Err(error) = self.editor.set_encryption_mode(&requested_mode)
+        {
+            self.status = error;
+        }
         ui.label("The profile preserves these options. OS-wide capture and driver features require a runtime backend that implements them.");
         ui.separator();
         ui.strong("Local DNS listener");

@@ -73,7 +73,7 @@ Packet inspection is intentionally out of scope for the core project. Dedicated 
 - Windows Service / console daemon.
 - Connection logging and byte counters.
 - Proxy connectivity checks.
-- PPX v100–102 import/write support, including nested authentication, chains, DNS/interface configuration, and preservation of unknown extension fields.
+- PPX v100–102 import/write support, including nested authentication, Windows account-bound DPAPI credentials, chains, DNS/interface configuration, and preservation of unknown extension fields.
 
 ## Not finished yet
 
@@ -82,7 +82,7 @@ The following areas are intentionally tracked as incomplete:
 - Kernel DNS datagram capture/injection and full system-DNS integration.
 - UDP policy and routing.
 - HTTP-only request forwarding.
-- Protected PPX credential decrypt/generation.
+- PPX Basic and master-password credential decrypt/generation (Windows account-bound DPAPI mode is supported).
 - Continuous background health checks.
 - Manual startup overrides.
 - Service / other-user / leak-prevention policy.

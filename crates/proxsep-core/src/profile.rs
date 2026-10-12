@@ -16,6 +16,8 @@ pub struct Profile {
     pub proxies: Vec<Proxy>,
     pub chains: Vec<Chain>,
     pub rules: Vec<Rule>,
+    /// In-memory credential provenance; never serialized into PPX.
+    pub credential_state: CredentialState,
     /// Original document preserves opaque extensions and product metadata.
     pub original_xml: Option<String>,
 }
@@ -31,9 +33,16 @@ impl Default for Profile {
                 name: "Default".into(),
                 ..Rule::default()
             }],
+            credential_state: CredentialState::Plaintext,
             original_xml: None,
         }
     }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialState {
+    Plaintext,
+    Opaque,
+    AccountUnlocked,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
@@ -237,6 +246,14 @@ fn bool_child(e: &Element, n: &str, d: bool) -> Result<bool, ProfileError> {
 }
 
 impl Profile {
+    pub fn from_xml_for_current_user(xml: &str) -> Result<Self, ProfileError> {
+        let mut profile = Self::from_xml(xml)?;
+        if profile.options.encryption_mode == "account" {
+            profile.unlock_account_credentials()?;
+        }
+        Ok(profile)
+    }
+
     pub fn from_xml(xml: &str) -> Result<Self, ProfileError> {
         if xml.len() > 5 * 1024 * 1024 {
             return Err(invalid("profile exceeds 5 MiB"));
@@ -274,6 +291,12 @@ impl Profile {
                     other => other,
                 }
                 .into();
+                p.credential_state = if matches!(opt.encryption_mode.as_str(), "disabled" | "none")
+                {
+                    CredentialState::Plaintext
+                } else {
+                    CredentialState::Opaque
+                };
             }
             if let Some(e) = o.get_child("ConnectionLoopDetection") {
                 opt.connection_loop_detection = boolean(attr(e, "enabled", "true"))?;
@@ -449,6 +472,9 @@ impl Profile {
         let Some(password) = proxy.password.as_deref().filter(|p| !p.is_empty()) else {
             return Ok(false);
         };
+        if self.credential_state == CredentialState::AccountUnlocked {
+            return Ok(false);
+        }
         if !matches!(self.options.encryption_mode.as_str(), "disabled" | "none") {
             return Ok(true);
         }
@@ -464,8 +490,73 @@ impl Profile {
             .iter()
             .any(|old| old.password.as_deref() == Some(password)))
     }
+    pub fn enable_account_protection(&mut self) -> Result<(), ProfileError> {
+        for proxy in &self.proxies {
+            if self.password_is_protected(proxy)? {
+                return Err(ProfileError::Encode(
+                    "opaque credentials must be unlocked or replaced before enabling account protection"
+                        .into(),
+                ));
+            }
+        }
+        self.options.encryption_mode = "account".into();
+        self.credential_state = CredentialState::AccountUnlocked;
+        Ok(())
+    }
+    pub fn unlock_account_credentials(&mut self) -> Result<(), ProfileError> {
+        if self.options.encryption_mode != "account" {
+            return Err(ProfileError::Decode(
+                "profile is not protected for the current Windows account".into(),
+            ));
+        }
+        if self.credential_state == CredentialState::AccountUnlocked {
+            return Ok(());
+        }
+        let source = self
+            .original_xml
+            .as_deref()
+            .ok_or_else(|| invalid("account-protected profile has no source document"))?;
+        let root = Element::parse(source.as_bytes()).map_err(|e| invalid(e.to_string()))?;
+        let hash = root
+            .get_child("Options")
+            .and_then(|options| options.get_child("Encryption"))
+            .map(|encryption| text(encryption, "Hash"))
+            .unwrap_or_default();
+        let check = crate::credentials::unprotect_account(&hash).map_err(invalid)?;
+        if check != "A" {
+            return Err(invalid("account protection validation failed"));
+        }
+        let mut decrypted = Vec::with_capacity(self.proxies.len());
+        for proxy in &self.proxies {
+            decrypted.push(
+                proxy
+                    .password
+                    .as_deref()
+                    .map(crate::credentials::unprotect_account)
+                    .transpose()
+                    .map_err(invalid)?,
+            );
+        }
+        for (proxy, password) in self.proxies.iter_mut().zip(decrypted) {
+            proxy.password = password;
+        }
+        self.credential_state = CredentialState::AccountUnlocked;
+        Ok(())
+    }
     pub fn to_xml(&self) -> Result<String, ProfileError> {
         self.validate()?;
+        let account_unlocked = self.options.encryption_mode == "account"
+            && self.credential_state == CredentialState::AccountUnlocked;
+        if self.credential_state == CredentialState::AccountUnlocked
+            && !matches!(
+                self.options.encryption_mode.as_str(),
+                "account" | "disabled" | "none"
+            )
+        {
+            return Err(ProfileError::Encode(
+                "unlocked account credentials cannot be relabeled as another protected mode".into(),
+            ));
+        }
         let original = self
             .original_xml
             .as_deref()
@@ -486,7 +577,9 @@ impl Profile {
                 }
             }
         }
-        if !matches!(self.options.encryption_mode.as_str(), "disabled" | "none") {
+        if !matches!(self.options.encryption_mode.as_str(), "disabled" | "none")
+            && !account_unlocked
+        {
             if matches!(self.options.encryption_mode.as_str(), "account" | "master")
                 && !original
                     .as_ref()
@@ -534,7 +627,18 @@ impl Profile {
             p.resolve.exclusion_only_from_list,
         );
         set_text(r, "DnsUdpMode", p.resolve.dns_udp_mode);
-        set_attr(child(o, "Encryption"), "mode", &p.encryption_mode);
+        let encryption = child(o, "Encryption");
+        set_attr(encryption, "mode", &p.encryption_mode);
+        if account_unlocked {
+            let hash = crate::credentials::protect_account("A").map_err(ProfileError::Encode)?;
+            set_text(encryption, "Hash", hash);
+        } else if matches!(p.encryption_mode.as_str(), "disabled" | "none") {
+            encryption.children.retain(|node| {
+                !node
+                    .as_element()
+                    .is_some_and(|element| element.name == "Hash")
+            });
+        }
         let e = child(o, "ConnectionLoopDetection");
         set_attr(e, "enabled", p.connection_loop_detection);
         set_attr(e, "resolve", p.connection_loop_resolve);
@@ -548,6 +652,22 @@ impl Profile {
         ] {
             set_flag(o, n, v);
         }
+        let serialized_passwords = self
+            .proxies
+            .iter()
+            .map(|proxy| {
+                if account_unlocked {
+                    proxy
+                        .password
+                        .as_deref()
+                        .map(crate::credentials::protect_account)
+                        .transpose()
+                        .map_err(ProfileError::Encode)
+                } else {
+                    Ok(proxy.password.clone())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         rebuild(
             &mut root,
             "ProxyList",
@@ -566,7 +686,11 @@ impl Profile {
                 set_attr(a, "enabled", p.username.is_some());
                 if let Some(u) = &p.username {
                     set_text(a, "Username", u);
-                    set_text(a, "Password", p.password.as_deref().unwrap_or(""));
+                    set_text(
+                        a,
+                        "Password",
+                        serialized_passwords[i].as_deref().unwrap_or(""),
+                    );
                 }
             },
         );

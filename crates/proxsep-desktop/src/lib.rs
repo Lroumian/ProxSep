@@ -1,4 +1,4 @@
-use proxsep_core::profile::{Action, Profile};
+use proxsep_core::profile::{Action, CredentialState, Profile};
 
 pub fn window_title(profile_name: &str, dirty: bool) -> String {
     format!(
@@ -124,9 +124,50 @@ impl ProfileEditor {
     }
 
     pub fn replace_xml(&mut self, xml: &str) -> Result<(), String> {
-        let profile = Profile::from_xml(xml).map_err(|error| error.to_string())?;
+        let profile = Profile::from_xml_for_current_user(xml).map_err(|error| error.to_string())?;
         self.profile = Self::new(profile).profile;
         self.dirty = false;
+        Ok(())
+    }
+
+    pub fn set_encryption_mode(&mut self, mode: &str) -> Result<(), String> {
+        if self
+            .profile
+            .options
+            .encryption_mode
+            .eq_ignore_ascii_case(mode)
+        {
+            return Ok(());
+        }
+        match mode {
+            "account" => self
+                .profile
+                .enable_account_protection()
+                .map_err(|error| error.to_string())?,
+            "disabled" | "none" => {
+                for proxy in &self.profile.proxies {
+                    if self
+                        .profile
+                        .password_is_protected(proxy)
+                        .map_err(|error| error.to_string())?
+                    {
+                        return Err(
+                            "Unlock or replace opaque credentials before disabling encryption"
+                                .into(),
+                        );
+                    }
+                }
+                self.profile.options.encryption_mode = "disabled".into();
+                self.profile.credential_state = CredentialState::Plaintext;
+            }
+            "basic" | "master" => {
+                return Err(format!(
+                    "Creating {mode} credential protection is not supported; imported values are preserved"
+                ));
+            }
+            _ => return Err(format!("Unsupported encryption mode: {mode}")),
+        }
+        self.dirty = true;
         Ok(())
     }
 }
@@ -235,6 +276,54 @@ mod tests {
             ))
             .unwrap();
         assert!(!editor.dirty);
+    }
+
+    #[test]
+    fn encryption_mode_changes_only_use_supported_credential_backends() {
+        let mut editor = fixture();
+
+        editor.set_encryption_mode("account").unwrap();
+        assert_eq!(editor.profile.options.encryption_mode, "account");
+        assert_eq!(
+            editor.profile.credential_state,
+            proxsep_core::profile::CredentialState::AccountUnlocked
+        );
+        assert!(editor.dirty);
+
+        editor.dirty = false;
+        let before = editor.profile.clone();
+        assert!(editor.set_encryption_mode("master").is_err());
+        assert_eq!(editor.profile, before);
+        assert!(!editor.dirty);
+
+        editor.set_encryption_mode("disabled").unwrap();
+        assert_eq!(editor.profile.options.encryption_mode, "disabled");
+        assert_eq!(
+            editor.profile.credential_state,
+            proxsep_core::profile::CredentialState::Plaintext
+        );
+        assert!(editor.dirty);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disabling_unlocked_account_protection_removes_the_hash() {
+        let mut profile = Profile::default();
+        profile.proxies.push(proxsep_core::profile::Proxy {
+            username: Some("user".into()),
+            password: Some("secret".into()),
+            ..Default::default()
+        });
+        profile.enable_account_protection().unwrap();
+        let protected = profile.to_xml().unwrap();
+        let loaded = Profile::from_xml_for_current_user(&protected).unwrap();
+        let mut editor = ProfileEditor::new(loaded);
+
+        editor.set_encryption_mode("disabled").unwrap();
+        let plaintext = editor.profile.to_xml().unwrap();
+        assert!(plaintext.contains("mode=\"disabled\""));
+        assert!(!plaintext.contains("<Hash>"));
+        assert!(plaintext.contains("<Password>secret</Password>"));
     }
 
     #[test]

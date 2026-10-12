@@ -1,4 +1,4 @@
-use proxsep_core::profile::Profile;
+use proxsep_core::profile::{CredentialState, Profile, Proxy};
 
 const PROFILE: &str = r#"<ProxifierProfile version="102" platform="Windows" product_id="7" product_minver="414" vendor="keep"><Options><Encryption mode="none"/><VendorOption enabled="true"/></Options><ProxyList><Proxy id="100" type="SOCKS5"><Address>localhost</Address><Port>1080</Port><Authentication enabled="true"><Username>user</Username><Password>pass</Password></Authentication><Future>keep</Future></Proxy></ProxyList><ChainList><Chain id="101" type="redundancy"><Name>Fallback</Name><Proxy enabled="true">100</Proxy><RedundancyTryDirect>true</RedundancyTryDirect></Chain></ChainList><RuleList><Rule enabled="true"><Name>Default</Name><Action type="Chain">101</Action></Rule></RuleList></ProxifierProfile>"#;
 
@@ -50,7 +50,7 @@ fn protected_password_preservation_does_not_forbid_username_edits() {
 }
 
 #[test]
-fn new_account_and_master_modes_require_the_unimplemented_hash_backend() {
+fn protected_modes_require_explicit_backend_activation() {
     for mode in ["account", "master"] {
         let p = Profile {
             options: proxsep_core::profile::Options {
@@ -64,6 +64,20 @@ fn new_account_and_master_modes_require_the_unimplemented_hash_backend() {
             "must not invent a protected Hash for {mode}"
         );
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn account_protection_enforces_the_native_password_bound() {
+    let mut profile = Profile::default();
+    profile.proxies.push(Proxy {
+        username: Some("user".into()),
+        password: Some("x".repeat(257)),
+        ..Proxy::default()
+    });
+    profile.enable_account_protection().unwrap();
+    let error = profile.to_xml().unwrap_err().to_string();
+    assert!(error.contains("256 UTF-16 code units"));
 }
 
 #[test]
@@ -84,4 +98,62 @@ fn switching_to_plaintext_requires_replacing_opaque_passwords() {
     );
     p.proxies[0].password = Some("new-explicit-plain-password".into());
     assert!(p.to_xml().is_ok());
+}
+
+#[cfg(windows)]
+#[test]
+fn account_protection_round_trips_for_the_current_windows_user() {
+    let mut profile = Profile::default();
+    profile.proxies.push(Proxy {
+        username: Some("账户用户".into()),
+        password: Some("päss秘密".into()),
+        ..Proxy::default()
+    });
+    profile.enable_account_protection().unwrap();
+    assert_eq!(profile.credential_state, CredentialState::AccountUnlocked);
+
+    let xml = profile.to_xml().unwrap();
+    assert!(xml.contains("mode=\"account\""));
+    assert!(xml.contains("<Hash>"));
+    assert!(!xml.contains("päss秘密"));
+
+    let mut imported = Profile::from_xml(&xml).unwrap();
+    assert_eq!(imported.credential_state, CredentialState::Opaque);
+    assert!(
+        imported
+            .password_is_protected(&imported.proxies[0])
+            .unwrap()
+    );
+    imported.unlock_account_credentials().unwrap();
+    assert_eq!(imported.credential_state, CredentialState::AccountUnlocked);
+    assert_eq!(imported.proxies[0].username.as_deref(), Some("账户用户"));
+    assert_eq!(imported.proxies[0].password.as_deref(), Some("päss秘密"));
+    assert!(
+        !imported
+            .password_is_protected(&imported.proxies[0])
+            .unwrap()
+    );
+
+    let loaded = Profile::from_xml_for_current_user(&xml).unwrap();
+    assert_eq!(loaded.credential_state, CredentialState::AccountUnlocked);
+    assert_eq!(loaded.proxies[0].password.as_deref(), Some("päss秘密"));
+}
+
+#[cfg(windows)]
+#[test]
+fn account_unlock_rejects_a_tampered_carrier_atomically() {
+    let mut profile = Profile::default();
+    profile.proxies.push(Proxy {
+        username: Some("user".into()),
+        password: Some("secret".into()),
+        ..Proxy::default()
+    });
+    profile.enable_account_protection().unwrap();
+    let xml = profile.to_xml().unwrap();
+
+    let mut imported = Profile::from_xml(&xml).unwrap();
+    imported.proxies[0].password = Some("AAAA".into());
+    assert!(imported.unlock_account_credentials().is_err());
+    assert_eq!(imported.credential_state, CredentialState::Opaque);
+    assert_eq!(imported.proxies[0].password.as_deref(), Some("AAAA"));
 }

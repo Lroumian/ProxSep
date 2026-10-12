@@ -2103,6 +2103,7 @@ dependencies = [
 name = "proxsep-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "quick-xml 0.38.4",
  "serde",
  "thiserror 2.0.21",

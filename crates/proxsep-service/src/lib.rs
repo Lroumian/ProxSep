@@ -43,7 +43,7 @@ pub fn load_profile(config: &EngineConfig) -> Result<proxsep_core::profile::Prof
     config.validate()?;
     let xml = std::fs::read_to_string(&config.profile_path)
         .map_err(|e| format!("cannot read profile: {e}"))?;
-    proxsep_core::profile::Profile::from_xml(&xml).map_err(|e| e.to_string())
+    proxsep_core::profile::Profile::from_xml_for_current_user(&xml).map_err(|e| e.to_string())
 }
 
 pub async fn start_engine(

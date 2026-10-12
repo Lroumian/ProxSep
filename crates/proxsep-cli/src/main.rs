@@ -318,5 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn load_profile(path: &PathBuf) -> Result<Profile, Box<dyn std::error::Error>> {
-    Ok(Profile::from_xml(&std::fs::read_to_string(path)?)?)
+    Ok(Profile::from_xml_for_current_user(
+        &std::fs::read_to_string(path)?,
+    )?)
 }
