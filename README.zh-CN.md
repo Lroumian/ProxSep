@@ -1,6 +1,10 @@
 # ProxSep
 
 <p align="center">
+  <a href="./README.md">English</a> | <strong>简体中文</strong>
+</p>
+
+<p align="center">
   <strong>面向开发者、逆向工程师与高级用户的 Rust 原生 Windows 代理路由器与流量策略引擎。</strong>
 </p>
 
