@@ -1,13 +1,13 @@
 //! Shared command contract for desktop, CLI, JSON, and MCP adapters.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr},
     sync::Arc,
 };
 
 use proxsep_core::{
-    profile::{Action, Profile},
+    profile::{Action, CredentialState, Profile},
     rules::{Connection, RuleEngine},
 };
 use proxsep_runtime::Runtime;
@@ -79,6 +79,8 @@ pub enum CommandError {
     InvalidArguments(String),
     #[error("command requires a live runtime")]
     RuntimeRequired,
+    #[error("not found: {0}")]
+    NotFound(String),
     #[error("command failed: {0}")]
     Failed(String),
 }
@@ -90,9 +92,284 @@ pub struct CommandContext {
 
 type Handler = fn(&CommandRegistry, &CommandContext, Value) -> Result<Value, CommandError>;
 
+#[derive(Debug, Clone, Copy)]
+enum ProfileOptionField {
+    ResolveAutoModeDetection,
+    ResolveViaProxy,
+    ResolveBlockNonATypes,
+    ResolveExclusionList,
+    ResolveExclusionOnlyFromList,
+    ResolveDnsUdpMode,
+    EncryptionMode,
+    ConnectionLoopDetection,
+    ConnectionLoopResolve,
+    UdpMode,
+    LeakPrevention,
+    ProcessOtherUsers,
+    ProcessServices,
+    HandleDirectConnections,
+    HttpProxiesSupport,
+}
+
+const PROFILE_OPTION_FIELDS: [ProfileOptionField; 15] = [
+    ProfileOptionField::ResolveAutoModeDetection,
+    ProfileOptionField::ResolveViaProxy,
+    ProfileOptionField::ResolveBlockNonATypes,
+    ProfileOptionField::ResolveExclusionList,
+    ProfileOptionField::ResolveExclusionOnlyFromList,
+    ProfileOptionField::ResolveDnsUdpMode,
+    ProfileOptionField::EncryptionMode,
+    ProfileOptionField::ConnectionLoopDetection,
+    ProfileOptionField::ConnectionLoopResolve,
+    ProfileOptionField::UdpMode,
+    ProfileOptionField::LeakPrevention,
+    ProfileOptionField::ProcessOtherUsers,
+    ProfileOptionField::ProcessServices,
+    ProfileOptionField::HandleDirectConnections,
+    ProfileOptionField::HttpProxiesSupport,
+];
+
+#[derive(Debug, Clone, Copy)]
+enum ProxyField {
+    Protocol,
+    Address,
+    Port,
+    Label,
+    UserAgent,
+    Options,
+}
+
+const PROXY_FIELDS: [ProxyField; 6] = [
+    ProxyField::Protocol,
+    ProxyField::Address,
+    ProxyField::Port,
+    ProxyField::Label,
+    ProxyField::UserAgent,
+    ProxyField::Options,
+];
+
+impl ProxyField {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Protocol => "protocol",
+            Self::Address => "address",
+            Self::Port => "port",
+            Self::Label => "label",
+            Self::UserAgent => "user_agent",
+            Self::Options => "options",
+        }
+    }
+
+    fn value_schema(self) -> Value {
+        match self {
+            Self::Protocol => json!({
+                "type": "string",
+                "enum": ["SOCKS4", "SOCKS4A", "SOCKS5", "HTTPS", "HTTP"]
+            }),
+            Self::Port => json!({ "type": "integer", "minimum": 1, "maximum": 65535 }),
+            Self::Options => json!({ "type": "integer", "minimum": 0, "maximum": 4294967295_u64 }),
+            _ => json!({ "type": "string" }),
+        }
+    }
+
+    fn value(self, proxy: &proxsep_core::profile::Proxy) -> Value {
+        match self {
+            Self::Protocol => json!(proxy.protocol),
+            Self::Address => json!(proxy.address),
+            Self::Port => json!(proxy.port),
+            Self::Label => json!(proxy.label),
+            Self::UserAgent => json!(proxy.user_agent),
+            Self::Options => json!(proxy.options),
+        }
+    }
+
+    fn set(
+        self,
+        proxy: &mut proxsep_core::profile::Proxy,
+        value: Value,
+    ) -> Result<(), CommandError> {
+        let invalid_type = || {
+            CommandError::InvalidArguments(format!(
+                "value for proxy.{} has the wrong type or range",
+                self.id()
+            ))
+        };
+        match self {
+            Self::Protocol => {
+                let protocol = value.as_str().ok_or_else(invalid_type)?;
+                if !["SOCKS4", "SOCKS4A", "SOCKS5", "HTTPS", "HTTP"].contains(&protocol) {
+                    return Err(invalid_type());
+                }
+                proxy.protocol = protocol.to_owned();
+            }
+            Self::Address => proxy.address = value.as_str().ok_or_else(invalid_type)?.to_owned(),
+            Self::Port => {
+                proxy.port = value
+                    .as_u64()
+                    .and_then(|value| u16::try_from(value).ok())
+                    .filter(|value| *value != 0)
+                    .ok_or_else(invalid_type)?
+            }
+            Self::Label => proxy.label = value.as_str().ok_or_else(invalid_type)?.to_owned(),
+            Self::UserAgent => {
+                proxy.user_agent = value.as_str().ok_or_else(invalid_type)?.to_owned()
+            }
+            Self::Options => {
+                proxy.options = value
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(invalid_type)?
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ProfileOptionField {
+    fn id(self) -> &'static str {
+        match self {
+            Self::ResolveAutoModeDetection => "resolve.auto_mode_detection",
+            Self::ResolveViaProxy => "resolve.via_proxy",
+            Self::ResolveBlockNonATypes => "resolve.block_non_a_types",
+            Self::ResolveExclusionList => "resolve.exclusion_list",
+            Self::ResolveExclusionOnlyFromList => "resolve.exclusion_only_from_list",
+            Self::ResolveDnsUdpMode => "resolve.dns_udp_mode",
+            Self::EncryptionMode => "encryption_mode",
+            Self::ConnectionLoopDetection => "connection_loop_detection",
+            Self::ConnectionLoopResolve => "connection_loop_resolve",
+            Self::UdpMode => "udp_mode",
+            Self::LeakPrevention => "leak_prevention",
+            Self::ProcessOtherUsers => "process_other_users",
+            Self::ProcessServices => "process_services",
+            Self::HandleDirectConnections => "handle_direct_connections",
+            Self::HttpProxiesSupport => "http_proxies_support",
+        }
+    }
+
+    fn value_schema(self) -> Value {
+        match self {
+            Self::ResolveExclusionList => json!({ "type": "string" }),
+            Self::ResolveDnsUdpMode => {
+                json!({ "type": "integer", "minimum": 0, "maximum": 255 })
+            }
+            Self::EncryptionMode => json!({
+                "type": "string",
+                "enum": ["disabled", "account", "basic", "master"]
+            }),
+            Self::UdpMode => json!({
+                "type": "string",
+                "enum": ["mode_bypass", "mode_block_443", "mode_block_all"]
+            }),
+            _ => json!({ "type": "boolean" }),
+        }
+    }
+
+    fn value(self, profile: &Profile) -> Value {
+        let options = &profile.options;
+        match self {
+            Self::ResolveAutoModeDetection => json!(options.resolve.auto_mode_detection),
+            Self::ResolveViaProxy => json!(options.resolve.via_proxy),
+            Self::ResolveBlockNonATypes => json!(options.resolve.block_non_a_types),
+            Self::ResolveExclusionList => json!(options.resolve.exclusion_list),
+            Self::ResolveExclusionOnlyFromList => {
+                json!(options.resolve.exclusion_only_from_list)
+            }
+            Self::ResolveDnsUdpMode => json!(options.resolve.dns_udp_mode),
+            Self::EncryptionMode => json!(options.encryption_mode),
+            Self::ConnectionLoopDetection => json!(options.connection_loop_detection),
+            Self::ConnectionLoopResolve => json!(options.connection_loop_resolve),
+            Self::UdpMode => json!(options.udp_mode),
+            Self::LeakPrevention => json!(options.leak_prevention),
+            Self::ProcessOtherUsers => json!(options.process_other_users),
+            Self::ProcessServices => json!(options.process_services),
+            Self::HandleDirectConnections => json!(options.handle_direct_connections),
+            Self::HttpProxiesSupport => json!(options.http_proxies_support),
+        }
+    }
+
+    fn set(self, profile: &mut Profile, value: Value) -> Result<(), CommandError> {
+        let invalid_type = || {
+            CommandError::InvalidArguments(format!(
+                "value for options.{} has the wrong type or range",
+                self.id()
+            ))
+        };
+        match self {
+            Self::ResolveAutoModeDetection => {
+                profile.options.resolve.auto_mode_detection =
+                    value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::ResolveViaProxy => {
+                profile.options.resolve.via_proxy = value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::ResolveBlockNonATypes => {
+                profile.options.resolve.block_non_a_types =
+                    value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::ResolveExclusionList => {
+                profile.options.resolve.exclusion_list =
+                    value.as_str().ok_or_else(invalid_type)?.to_owned()
+            }
+            Self::ResolveExclusionOnlyFromList => {
+                profile.options.resolve.exclusion_only_from_list =
+                    value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::ResolveDnsUdpMode => {
+                profile.options.resolve.dns_udp_mode = value
+                    .as_u64()
+                    .and_then(|value| u8::try_from(value).ok())
+                    .ok_or_else(invalid_type)?
+            }
+            Self::EncryptionMode => {
+                set_encryption_mode(profile, value.as_str().ok_or_else(invalid_type)?)?
+            }
+            Self::ConnectionLoopDetection => {
+                profile.options.connection_loop_detection =
+                    value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::ConnectionLoopResolve => {
+                profile.options.connection_loop_resolve =
+                    value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::UdpMode => {
+                let mode = value.as_str().ok_or_else(invalid_type)?;
+                if !["mode_bypass", "mode_block_443", "mode_block_all"].contains(&mode) {
+                    return Err(invalid_type());
+                }
+                profile.options.udp_mode = mode.to_owned();
+            }
+            Self::LeakPrevention => {
+                profile.options.leak_prevention = value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::ProcessOtherUsers => {
+                profile.options.process_other_users = value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::ProcessServices => {
+                profile.options.process_services = value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::HandleDirectConnections => {
+                profile.options.handle_direct_connections =
+                    value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::HttpProxiesSupport => {
+                profile.options.http_proxies_support = value.as_bool().ok_or_else(invalid_type)?
+            }
+        }
+        Ok(())
+    }
+}
+
+enum CommandHandler {
+    Function(Handler),
+    ProfileOptionGet(ProfileOptionField),
+    ProfileOptionSet(ProfileOptionField),
+    ProxyFieldGet(ProxyField),
+    ProxyFieldSet(ProxyField),
+}
+
 struct RegisteredCommand {
     descriptor: CommandDescriptor,
-    handler: Handler,
+    handler: CommandHandler,
 }
 
 pub struct CommandRegistry {
@@ -170,6 +447,127 @@ impl CommandRegistry {
             ),
             profile_normalize,
         );
+        registry.register(
+            descriptor(
+                "options.get",
+                "options",
+                "Read all non-secret PPX profile options",
+                CommandRisk::ReadOnly,
+                required_string_schema("xml"),
+                schema("object"),
+            ),
+            options_get,
+        );
+        registry.register(
+            descriptor(
+                "options.field.list",
+                "options",
+                "List editable PPX option fields and value schemas",
+                CommandRisk::ReadOnly,
+                empty_schema(),
+                schema("array"),
+            ),
+            options_field_list,
+        );
+        for field in PROFILE_OPTION_FIELDS {
+            let get_id = format!("options.{}.get", field.id());
+            let set_id = format!("options.{}.set", field.id());
+            registry.register_handler(
+                descriptor(
+                    &get_id,
+                    "options",
+                    &format!("Read PPX option {}", field.id()),
+                    CommandRisk::ReadOnly,
+                    required_string_schema("xml"),
+                    profile_option_output_schema(field),
+                ),
+                CommandHandler::ProfileOptionGet(field),
+            );
+            registry.register_handler(
+                descriptor(
+                    &set_id,
+                    "options",
+                    &format!("Set PPX option {} and return validated XML", field.id()),
+                    CommandRisk::Mutating,
+                    profile_option_set_schema(field),
+                    profile_option_set_output_schema(field),
+                ),
+                CommandHandler::ProfileOptionSet(field),
+            );
+        }
+        for (id, summary, handler) in [
+            (
+                "proxy.list",
+                "List proxies without exposing credential values",
+                proxy_list as Handler,
+            ),
+            (
+                "proxy.get",
+                "Read one proxy without exposing credential values",
+                proxy_get as Handler,
+            ),
+            (
+                "proxy.count",
+                "Count configured proxies",
+                proxy_count as Handler,
+            ),
+            (
+                "proxy.id.next",
+                "Find the first available positive proxy identifier",
+                proxy_next_id as Handler,
+            ),
+            (
+                "proxy.references",
+                "List chains and rules that reference a proxy",
+                proxy_references as Handler,
+            ),
+        ] {
+            let input_schema = match id {
+                "proxy.get" | "proxy.references" => profile_id_schema(),
+                _ => required_string_schema("xml"),
+            };
+            registry.register(
+                descriptor(
+                    id,
+                    "proxy",
+                    summary,
+                    CommandRisk::ReadOnly,
+                    input_schema,
+                    schema(if id == "proxy.list" {
+                        "array"
+                    } else {
+                        "object"
+                    }),
+                ),
+                handler,
+            );
+        }
+        for field in PROXY_FIELDS {
+            let get_id = format!("proxy.{}.get", field.id());
+            let set_id = format!("proxy.{}.set", field.id());
+            registry.register_handler(
+                descriptor(
+                    &get_id,
+                    "proxy",
+                    &format!("Read proxy field {}", field.id()),
+                    CommandRisk::ReadOnly,
+                    profile_id_schema(),
+                    proxy_field_output_schema(field, false),
+                ),
+                CommandHandler::ProxyFieldGet(field),
+            );
+            registry.register_handler(
+                descriptor(
+                    &set_id,
+                    "proxy",
+                    &format!("Set proxy field {} and return validated XML", field.id()),
+                    CommandRisk::Mutating,
+                    proxy_field_set_schema(field),
+                    proxy_field_output_schema(field, true),
+                ),
+                CommandHandler::ProxyFieldSet(field),
+            );
+        }
         registry.register(
             descriptor(
                 "route.decide",
@@ -323,7 +721,13 @@ impl CommandRegistry {
             .commands
             .get(id)
             .ok_or_else(|| CommandError::Unknown(id.into()))?;
-        (command.handler)(self, context, arguments)
+        match &command.handler {
+            CommandHandler::Function(handler) => handler(self, context, arguments),
+            CommandHandler::ProfileOptionGet(field) => profile_option_get(*field, arguments),
+            CommandHandler::ProfileOptionSet(field) => profile_option_set(*field, arguments),
+            CommandHandler::ProxyFieldGet(field) => proxy_field_get(*field, arguments),
+            CommandHandler::ProxyFieldSet(field) => proxy_field_set(*field, arguments),
+        }
     }
 
     pub fn execute_request(
@@ -350,6 +754,7 @@ impl CommandRegistry {
                         CommandError::Unknown(_) => "unknown_command",
                         CommandError::InvalidArguments(_) => "invalid_arguments",
                         CommandError::RuntimeRequired => "runtime_required",
+                        CommandError::NotFound(_) => "not_found",
                         CommandError::Failed(_) => "command_failed",
                     }
                     .into(),
@@ -378,6 +783,10 @@ impl CommandRegistry {
     }
 
     fn register(&mut self, descriptor: CommandDescriptor, handler: Handler) {
+        self.register_handler(descriptor, CommandHandler::Function(handler));
+    }
+
+    fn register_handler(&mut self, descriptor: CommandDescriptor, handler: CommandHandler) {
         let id = descriptor.id.clone();
         assert!(
             self.commands
@@ -471,6 +880,90 @@ fn route_schema() -> Value {
     })
 }
 
+fn profile_option_set_schema(field: ProfileOptionField) -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "value"],
+        "properties": {
+            "xml": { "type": "string" },
+            "value": field.value_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn profile_option_output_schema(field: ProfileOptionField) -> Value {
+    json!({
+        "type": "object",
+        "required": ["field", "value"],
+        "properties": {
+            "field": { "type": "string", "const": field.id() },
+            "value": field.value_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn profile_option_set_output_schema(field: ProfileOptionField) -> Value {
+    json!({
+        "type": "object",
+        "required": ["field", "value", "xml"],
+        "properties": {
+            "field": { "type": "string", "const": field.id() },
+            "value": field.value_schema(),
+            "xml": { "type": "string" }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn profile_id_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "id"],
+        "properties": {
+            "xml": { "type": "string" },
+            "id": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn proxy_field_set_schema(field: ProxyField) -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "id", "value"],
+        "properties": {
+            "xml": { "type": "string" },
+            "id": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+            "value": field.value_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn proxy_field_output_schema(field: ProxyField, include_xml: bool) -> Value {
+    let mut required = vec![json!("id"), json!("field"), json!("value")];
+    let mut properties = serde_json::Map::from_iter([
+        ("id".into(), json!({ "type": "integer" })),
+        (
+            "field".into(),
+            json!({ "type": "string", "const": field.id() }),
+        ),
+        ("value".into(), field.value_schema()),
+    ]);
+    if include_xml {
+        required.push(json!("xml"));
+        properties.insert("xml".into(), json!({ "type": "string" }));
+    }
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": properties,
+        "additionalProperties": false
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyArguments {}
@@ -485,6 +978,28 @@ struct IdArguments {
 #[serde(deny_unknown_fields)]
 struct ProfileArguments {
     xml: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileOptionSetArguments {
+    xml: String,
+    value: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileIdArguments {
+    xml: String,
+    id: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileIdValueArguments {
+    xml: String,
+    id: u32,
+    value: Value,
 }
 
 #[derive(Deserialize)]
@@ -573,10 +1088,20 @@ fn command_count(
 ) -> Result<Value, CommandError> {
     no_arguments(value)?;
     let mut domains = BTreeMap::<&str, usize>::new();
+    let mut risks = BTreeMap::<&str, usize>::new();
     for command in registry.commands.values() {
         *domains.entry(&command.descriptor.domain).or_default() += 1;
+        let risk = match command.descriptor.risk {
+            CommandRisk::ReadOnly => "read_only",
+            CommandRisk::Mutating => "mutating",
+            CommandRisk::Disruptive => "disruptive",
+        };
+        *risks.entry(risk).or_default() += 1;
     }
-    Ok(json!({ "total": registry.len(), "domains": domains }))
+    for risk in ["read_only", "mutating", "disruptive"] {
+        risks.entry(risk).or_default();
+    }
+    Ok(json!({ "total": registry.len(), "domains": domains, "risks": risks }))
 }
 
 fn profile_validate(
@@ -626,6 +1151,242 @@ fn profile_normalize(
         .to_xml()
         .map_err(|error| CommandError::Failed(error.to_string()))?;
     Ok(json!({ "xml": xml }))
+}
+
+fn options_value(profile: &Profile) -> Value {
+    let options = &profile.options;
+    json!({
+        "resolve": {
+            "auto_mode_detection": options.resolve.auto_mode_detection,
+            "via_proxy": options.resolve.via_proxy,
+            "block_non_a_types": options.resolve.block_non_a_types,
+            "exclusion_list": options.resolve.exclusion_list,
+            "exclusion_only_from_list": options.resolve.exclusion_only_from_list,
+            "dns_udp_mode": options.resolve.dns_udp_mode
+        },
+        "encryption_mode": options.encryption_mode,
+        "connection_loop_detection": options.connection_loop_detection,
+        "connection_loop_resolve": options.connection_loop_resolve,
+        "udp_mode": options.udp_mode,
+        "leak_prevention": options.leak_prevention,
+        "process_other_users": options.process_other_users,
+        "process_services": options.process_services,
+        "handle_direct_connections": options.handle_direct_connections,
+        "http_proxies_support": options.http_proxies_support
+    })
+}
+
+fn options_get(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProfileArguments = arguments(value)?;
+    Ok(options_value(&profile(&input.xml)?))
+}
+
+fn options_field_list(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    no_arguments(value)?;
+    Ok(Value::Array(
+        PROFILE_OPTION_FIELDS
+            .into_iter()
+            .map(|field| {
+                json!({
+                    "field": field.id(),
+                    "value_schema": field.value_schema(),
+                    "get_command": format!("options.{}.get", field.id()),
+                    "set_command": format!("options.{}.set", field.id())
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn profile_option_get(field: ProfileOptionField, value: Value) -> Result<Value, CommandError> {
+    let input: ProfileArguments = arguments(value)?;
+    let profile = profile(&input.xml)?;
+    Ok(json!({ "field": field.id(), "value": field.value(&profile) }))
+}
+
+fn profile_option_set(field: ProfileOptionField, value: Value) -> Result<Value, CommandError> {
+    let input: ProfileOptionSetArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    field.set(&mut profile, input.value)?;
+    let value = field.value(&profile);
+    let xml = profile
+        .to_xml()
+        .map_err(|error| CommandError::Failed(error.to_string()))?;
+    Ok(json!({ "field": field.id(), "value": value, "xml": xml }))
+}
+
+fn set_encryption_mode(profile: &mut Profile, mode: &str) -> Result<(), CommandError> {
+    if profile.options.encryption_mode.eq_ignore_ascii_case(mode) {
+        return Ok(());
+    }
+    match mode {
+        "account" => profile
+            .enable_account_protection()
+            .map_err(|error| CommandError::Failed(error.to_string())),
+        "disabled" => {
+            for proxy in &profile.proxies {
+                if profile
+                    .password_is_protected(proxy)
+                    .map_err(|error| CommandError::Failed(error.to_string()))?
+                {
+                    return Err(CommandError::Failed(
+                        "unlock or replace opaque credentials before disabling encryption".into(),
+                    ));
+                }
+            }
+            profile.options.encryption_mode = "disabled".into();
+            profile.credential_state = CredentialState::Plaintext;
+            Ok(())
+        }
+        "basic" | "master" => Err(CommandError::Failed(format!(
+            "creating {mode} credential protection is not supported; imported values are preserved"
+        ))),
+        _ => Err(CommandError::InvalidArguments(format!(
+            "unsupported encryption mode: {mode}"
+        ))),
+    }
+}
+
+fn profile_with_id(value: Value) -> Result<(Profile, u32), CommandError> {
+    let input: ProfileIdArguments = arguments(value)?;
+    if input.id == 0 {
+        return Err(CommandError::InvalidArguments(
+            "proxy ID must be non-zero".into(),
+        ));
+    }
+    Ok((profile(&input.xml)?, input.id))
+}
+
+fn proxy_value(proxy: &proxsep_core::profile::Proxy) -> Value {
+    json!({
+        "id": proxy.id,
+        "protocol": proxy.protocol,
+        "address": proxy.address,
+        "port": proxy.port,
+        "label": proxy.label,
+        "user_agent": proxy.user_agent,
+        "options": proxy.options,
+        "has_username": proxy.username.as_deref().is_some_and(|value| !value.is_empty()),
+        "has_password": proxy.password.as_deref().is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn proxy_list(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProfileArguments = arguments(value)?;
+    Ok(Value::Array(
+        profile(&input.xml)?
+            .proxies
+            .iter()
+            .map(proxy_value)
+            .collect(),
+    ))
+}
+
+fn proxy_get(_: &CommandRegistry, _: &CommandContext, value: Value) -> Result<Value, CommandError> {
+    let (profile, id) = profile_with_id(value)?;
+    profile
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == id)
+        .map(proxy_value)
+        .ok_or_else(|| CommandError::NotFound(format!("proxy {id}")))
+}
+
+fn proxy_count(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProfileArguments = arguments(value)?;
+    Ok(json!({ "count": profile(&input.xml)?.proxies.len() }))
+}
+
+fn proxy_next_id(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProfileArguments = arguments(value)?;
+    let profile = profile(&input.xml)?;
+    let existing = profile
+        .proxies
+        .iter()
+        .map(|proxy| proxy.id)
+        .collect::<HashSet<_>>();
+    let id = (1..u32::MAX)
+        .find(|id| !existing.contains(id))
+        .ok_or_else(|| CommandError::Failed("no proxy identifier is available".into()))?;
+    Ok(json!({ "id": id }))
+}
+
+fn proxy_references(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let (profile, id) = profile_with_id(value)?;
+    if !profile.proxies.iter().any(|proxy| proxy.id == id) {
+        return Err(CommandError::NotFound(format!("proxy {id}")));
+    }
+    let chains = profile
+        .chains
+        .iter()
+        .filter(|chain| chain.proxy_ids.contains(&id))
+        .map(|chain| json!({ "id": chain.id, "name": chain.name }))
+        .collect::<Vec<_>>();
+    let rules = profile
+        .rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| {
+            matches!(&rule.action, Action::Proxy(action_id) if action_id.parse::<u32>().ok() == Some(id))
+        })
+        .map(|(index, rule)| json!({ "index": index, "name": rule.name }))
+        .collect::<Vec<_>>();
+    Ok(json!({ "id": id, "chains": chains, "rules": rules }))
+}
+
+fn proxy_field_get(field: ProxyField, value: Value) -> Result<Value, CommandError> {
+    let (profile, id) = profile_with_id(value)?;
+    let proxy = profile
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == id)
+        .ok_or_else(|| CommandError::NotFound(format!("proxy {id}")))?;
+    Ok(json!({ "id": id, "field": field.id(), "value": field.value(proxy) }))
+}
+
+fn proxy_field_set(field: ProxyField, value: Value) -> Result<Value, CommandError> {
+    let input: ProfileIdValueArguments = arguments(value)?;
+    if input.id == 0 {
+        return Err(CommandError::InvalidArguments(
+            "proxy ID must be non-zero".into(),
+        ));
+    }
+    let mut profile = profile(&input.xml)?;
+    let proxy = profile
+        .proxies
+        .iter_mut()
+        .find(|proxy| proxy.id == input.id)
+        .ok_or_else(|| CommandError::NotFound(format!("proxy {}", input.id)))?;
+    field.set(proxy, input.value)?;
+    let value = field.value(proxy);
+    let xml = profile
+        .to_xml()
+        .map_err(|error| CommandError::Failed(error.to_string()))?;
+    Ok(json!({ "id": input.id, "field": field.id(), "value": value, "xml": xml }))
 }
 
 fn connection(input: RouteArguments) -> Result<(Profile, Connection), CommandError> {

@@ -72,9 +72,10 @@ operations are documented but are never registered as working commands.
 
 ## Current command families
 
-The first slice implements catalog discovery, PPX validation/summary/normalizing,
-route decision/trace, process lineage, retained/active connections, history
-cleanup, failure reset, runtime profile replacement, and DNS observation/reverse
-fake-IP lookup. The registry is the authoritative source for the exact current
-count; documentation must not hard-code it as if the 608-command target were
-already complete.
+The implemented catalog includes discovery, PPX validation/summary/normalizing,
+all modeled profile-option reads and validated writes, credential-safe proxy
+inventory and field editing, proxy reference analysis, route decision/trace,
+process lineage, retained/active connections, history cleanup, failure reset,
+runtime profile replacement, and DNS observation/reverse fake-IP lookup. The
+registry is the authoritative source for the exact current count; documentation
+must not hard-code it as if the 608-command target were already complete.
