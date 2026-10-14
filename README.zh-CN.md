@@ -82,7 +82,7 @@ ProxSep 不是为了逐像素复刻其他产品，而是一个独立实现的 Ru
 - 原生桌面配置编辑器。
 - CLI：配置校验、路由评估、服务启动、透明模式。
 - Windows Service / 控制台守护进程。
-- 连接日志与流量计数。
+- 实时连接视图：活动/历史筛选、生命周期状态、流量计数、路由上下文与逐连接规则轨迹。
 - 代理连通性检查。
 - PPX v100–102 导入与回写。
 - 支持嵌套认证、Windows 当前账户 DPAPI 凭据、代理链、DNS/接口配置。
@@ -218,6 +218,7 @@ cargo run -p proxsep-cli -- transparent 'C:\Profiles\Profile.ppx'
 ### v0.2 — 可观测路由
 
 - [x] Rule Decision Trace：解释规则为什么命中
+- [x] Live Connections：连接生命周期、流量计数、路由上下文与选中详情
 - [ ] Process Tree 与更完整的进程身份
 - [ ] DNS → Flow 关联
 - [ ] 连接时间线

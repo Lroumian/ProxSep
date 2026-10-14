@@ -3,24 +3,29 @@ pub mod windows;
 use proxsep_core::{
     dns::{DnsDecision, DnsMode, DnsPolicy, DnsResolver, FakeIpMap},
     profile::{Action, Chain, Profile, Proxy},
-    rules::{Connection, RuleEngine},
+    rules::{Connection, RuleEngine, RuleTrace},
 };
 use std::{
     collections::{HashMap, VecDeque},
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    ops::{Deref, DerefMut},
+    pin::Pin,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    task::{Context, Poll},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
     sync::{Semaphore, watch},
     task::{JoinHandle, JoinSet},
 };
+
+const MAX_CONNECTION_EVENTS: usize = 1000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -38,15 +43,36 @@ pub enum RuntimeError {
 #[derive(Debug, Clone)]
 pub struct ConnectionEvent {
     pub id: u64,
+    pub protocol: String,
     pub application: String,
+    pub pid: Option<u32>,
     pub target: String,
     pub port: u16,
+    pub resolved_ips: Vec<IpAddr>,
+    pub destination: Option<SocketAddr>,
+    pub interface_id: Option<String>,
+    pub bind_ips: Vec<IpAddr>,
     pub rule: String,
+    pub rule_trace: Vec<RuleTrace>,
     pub action: String,
     pub state: String,
+    pub started_at: SystemTime,
+    pub ended_at: Option<SystemTime>,
     pub sent: u64,
     pub received: u64,
     pub error: Option<String>,
+}
+impl ConnectionEvent {
+    pub fn is_active(&self) -> bool {
+        matches!(self.state.as_str(), "Connecting" | "Open")
+    }
+
+    pub fn duration(&self) -> Option<Duration> {
+        self.ended_at
+            .unwrap_or_else(SystemTime::now)
+            .duration_since(self.started_at)
+            .ok()
+    }
 }
 #[derive(Default)]
 struct ChainState {
@@ -59,7 +85,7 @@ struct ActiveProfile {
 }
 pub struct Runtime {
     profile: RwLock<ActiveProfile>,
-    events: Mutex<VecDeque<ConnectionEvent>>,
+    events: Arc<Mutex<VecDeque<ConnectionEvent>>>,
     next_id: AtomicU64,
     random: AtomicU64,
     dns: Mutex<DnsResolver>,
@@ -84,7 +110,7 @@ impl Runtime {
                 profile,
                 chains: Arc::new(Mutex::new(ChainState::default())),
             }),
-            events: Mutex::new(VecDeque::new()),
+            events: Arc::new(Mutex::new(VecDeque::new())),
             next_id: AtomicU64::new(1),
             random: AtomicU64::new(seed.max(1)),
             dns: Mutex::new(dns),
@@ -108,8 +134,20 @@ impl Runtime {
     pub fn events(&self) -> Vec<ConnectionEvent> {
         self.events.lock().unwrap().iter().cloned().collect()
     }
+    pub fn active_connections(&self) -> Vec<ConnectionEvent> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.is_active())
+            .cloned()
+            .collect()
+    }
     pub fn clear_events(&self) {
-        self.events.lock().unwrap().clear();
+        self.events
+            .lock()
+            .unwrap()
+            .retain(ConnectionEvent::is_active);
     }
     pub fn reset_failures(&self) {
         self.profile.write().unwrap().chains = Arc::new(Mutex::new(ChainState::default()));
@@ -129,9 +167,7 @@ impl Runtime {
         self.dns.lock().unwrap().handle_datagram(packet)
     }
     fn update(&self, id: u64, f: impl FnOnce(&mut ConnectionEvent)) {
-        if let Some(e) = self.events.lock().unwrap().iter_mut().find(|e| e.id == id) {
-            f(e);
-        }
+        update_event(&self.events, id, f);
     }
     fn random_index(&self, len: usize) -> usize {
         let mut old = self.random.load(Ordering::Relaxed);
@@ -149,8 +185,14 @@ impl Runtime {
             }
         }
     }
-    pub async fn connect(&self, c: &Connection) -> Result<TcpStream, RuntimeError> {
-        self.connect_recorded(c).await.map(|(s, _)| s)
+    pub async fn connect(&self, c: &Connection) -> Result<TrackedTcpStream, RuntimeError> {
+        self.connect_recorded(c)
+            .await
+            .map(|(stream, id)| TrackedTcpStream {
+                stream,
+                events: Arc::clone(&self.events),
+                id,
+            })
     }
     async fn connect_recorded(&self, c: &Connection) -> Result<(TcpStream, u64), RuntimeError> {
         let mut c = c.clone();
@@ -200,13 +242,17 @@ impl Runtime {
                 ));
             }
         }
-        let d = RuleEngine::new(&profile.rules).decide(&c);
-        c.bind_ips = d
+        let trace = RuleEngine::new(&profile.rules).trace(&c);
+        let rule = trace.decision.rule_name.to_owned();
+        let interface_id = trace.decision.interface_id.map(str::to_owned);
+        c.bind_ips = trace
+            .decision
             .interface_id
             .and_then(|id| c.interfaces.get(id))
             .cloned()
             .unwrap_or_default();
-        let mut action = d.action.clone();
+        let mut action = trace.decision.action.clone();
+        let rule_trace = trace.rules;
         if profile.options.connection_loop_detection
             && matches!(action, Action::Proxy(_) | Action::Chain(_))
             && profile
@@ -223,17 +269,29 @@ impl Runtime {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         {
             let mut events = self.events.lock().unwrap();
-            if events.len() == 1000 {
-                events.pop_front();
+            while events.len() >= MAX_CONNECTION_EVENTS {
+                let Some(completed) = events.iter().position(|event| !event.is_active()) else {
+                    break;
+                };
+                events.remove(completed);
             }
             events.push_back(ConnectionEvent {
                 id,
+                protocol: "TCP".into(),
                 application: c.application.clone(),
+                pid: c.pid,
                 target: c.target.clone(),
                 port: c.port,
-                rule: d.rule_name.into(),
+                resolved_ips: c.resolved_ips.clone(),
+                destination: c.destination,
+                interface_id,
+                bind_ips: c.bind_ips.clone(),
+                rule,
+                rule_trace,
                 action: format!("{action:?}"),
                 state: "Connecting".into(),
+                started_at: SystemTime::now(),
+                ended_at: None,
                 sent: 0,
                 received: 0,
                 error: None,
@@ -248,8 +306,7 @@ impl Runtime {
             }
             Err(error) => {
                 self.update(id, |e| {
-                    e.state = "Failed".into();
-                    e.error = Some(error.to_string());
+                    finish_event(e, "Failed", Some(error.to_string()));
                 });
                 Err(error)
             }
@@ -618,7 +675,7 @@ impl Runtime {
             .map(socks_reply)
             .unwrap_or_else(|| vec![5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
         if client.write_all(&reply).await.is_err() {
-            self.update(id, |e| e.state = "Closed".into());
+            self.update(id, |event| finish_event(event, "Closed", None));
             return;
         }
         self.relay(client, upstream, id, cancel).await;
@@ -642,7 +699,7 @@ impl Runtime {
                     return Ok::<_, io::Error>(());
                 }
                 uw.write_all(&buf[..n]).await?;
-                self.update(id, |e| e.sent += n as u64);
+                self.update(id, |event| event.sent = event.sent.saturating_add(n as u64));
             }
         };
         let inbound = async {
@@ -654,14 +711,90 @@ impl Runtime {
                     return Ok::<_, io::Error>(());
                 }
                 cw.write_all(&buf[..n]).await?;
-                self.update(id, |e| e.received += n as u64);
+                self.update(id, |event| {
+                    event.received = event.received.saturating_add(n as u64)
+                });
             }
         };
         let result = tokio::select! {biased;_=cancel.changed()=>Ok(()),result=async{tokio::try_join!(outbound,inbound).map(|_|())}=>result};
-        self.update(id, |e| {
-            e.state = "Closed".into();
-            if let Err(error) = result {
-                e.error = Some(error.to_string());
+        self.update(id, |event| {
+            finish_event(event, "Closed", result.err().map(|error| error.to_string()));
+        });
+    }
+}
+#[derive(Debug)]
+pub struct TrackedTcpStream {
+    stream: TcpStream,
+    events: Arc<Mutex<VecDeque<ConnectionEvent>>>,
+    id: u64,
+}
+impl Deref for TrackedTcpStream {
+    type Target = TcpStream;
+
+    fn deref(&self) -> &Self::Target {
+        &self.stream
+    }
+}
+impl DerefMut for TrackedTcpStream {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.stream
+    }
+}
+impl AsyncRead for TrackedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut self.stream).poll_read(context, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            let received = buffer.filled().len().saturating_sub(before) as u64;
+            if received != 0 {
+                update_event(&self.events, self.id, |event| {
+                    event.received = event.received.saturating_add(received)
+                });
+            }
+        }
+        result
+    }
+}
+impl AsyncWrite for TrackedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, io::Error>> {
+        let result = Pin::new(&mut self.stream).poll_write(context, buffer);
+        if let Poll::Ready(Ok(sent)) = result
+            && sent != 0
+        {
+            update_event(&self.events, self.id, |event| {
+                event.sent = event.sent.saturating_add(sent as u64)
+            });
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.stream).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), io::Error>> {
+        Pin::new(&mut self.stream).poll_shutdown(context)
+    }
+}
+impl Drop for TrackedTcpStream {
+    fn drop(&mut self) {
+        update_event(&self.events, self.id, |event| {
+            if event.is_active() {
+                finish_event(event, "Closed", None);
             }
         });
     }
@@ -704,21 +837,43 @@ struct AttemptGuard<'a> {
 }
 impl Drop for AttemptGuard<'_> {
     fn drop(&mut self) {
-        self.runtime.update(self.id, |e| {
-            if e.state == "Connecting" {
-                e.state = "Cancelled".into();
-                e.error = Some("connection cancelled".into());
+        self.runtime.update(self.id, |event| {
+            if event.state == "Connecting" {
+                finish_event(event, "Cancelled", Some("connection cancelled".into()));
             }
         });
     }
 }
 impl Drop for EventGuard<'_> {
     fn drop(&mut self) {
-        self.runtime.update(self.id, |e| {
-            if e.state == "Open" {
-                e.state = "Closed".into();
+        self.runtime.update(self.id, |event| {
+            if event.state == "Open" {
+                finish_event(event, "Closed", None);
             }
         });
+    }
+}
+fn finish_event(event: &mut ConnectionEvent, state: &str, error: Option<String>) {
+    event.state = state.into();
+    event.ended_at.get_or_insert_with(SystemTime::now);
+    if let Some(error) = error {
+        event.error = Some(error);
+    }
+}
+fn update_event(
+    events: &Mutex<VecDeque<ConnectionEvent>>,
+    id: u64,
+    update: impl FnOnce(&mut ConnectionEvent),
+) {
+    let mut events = events.lock().unwrap();
+    if let Some(event) = events.iter_mut().find(|event| event.id == id) {
+        update(event);
+    }
+    while events.len() > MAX_CONNECTION_EVENTS {
+        let Some(completed) = events.iter().position(|event| !event.is_active()) else {
+            break;
+        };
+        events.remove(completed);
     }
 }
 async fn tcp_connect(host: &str, port: u16, c: &Connection) -> io::Result<TcpStream> {

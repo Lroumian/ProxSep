@@ -72,7 +72,7 @@ Packet inspection is intentionally out of scope for the core project. Dedicated 
 - Native desktop profile editor.
 - CLI for validation, rule evaluation, serving, and transparent mode.
 - Windows Service / console daemon.
-- Connection logging and byte counters.
+- Live connection view with active/history filtering, lifecycle state, byte counters, route context, and per-connection rule traces.
 - Proxy connectivity checks.
 - PPX v100–102 import/write support, including nested authentication, Windows account-bound DPAPI credentials, chains, DNS/interface configuration, and preservation of unknown extension fields.
 
@@ -206,6 +206,7 @@ The transparent listener only accepts sockets backed by ProxSep WFP context/reco
 ### v0.2 — Observable routing
 
 - [x] Rule decision trace: explain exactly why a rule matched.
+- [x] Live Connections with lifecycle, traffic counters, route context, and selection details.
 - [ ] Process tree and richer process identity.
 - [ ] DNS-to-flow correlation.
 - [ ] Connection timeline.

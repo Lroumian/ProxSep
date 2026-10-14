@@ -10,7 +10,7 @@ use proxsep_core::{
     rules::{Connection, RuleEngine, RuleTraceOutcome},
 };
 use proxsep_desktop::{DiagnosticContextInput, ProfileEditor, window_title};
-use proxsep_runtime::{ListenerHandle, Runtime};
+use proxsep_runtime::{ConnectionEvent, ListenerHandle, Runtime};
 
 const DEFAULT_PROFILE: &str = include_str!("../../proxsep-core/tests/fixtures/default.ppx");
 
@@ -59,6 +59,8 @@ pub struct DesktopApp {
     listener_application: String,
     log_filter: String,
     errors_only: bool,
+    include_history: bool,
+    selected_connection: Option<u64>,
     dns_listener: Option<ListenerHandle>,
     dns_start_rx: Option<mpsc::Receiver<Result<ListenerHandle, String>>>,
     dns_address: String,
@@ -104,6 +106,8 @@ impl DesktopApp {
             listener_application: "socks-client.exe".into(),
             log_filter: String::new(),
             errors_only: false,
+            include_history: false,
+            selected_connection: None,
             dns_listener: None,
             dns_start_rx: None,
             dns_address: "127.0.0.1:5353".into(),
@@ -914,46 +918,7 @@ impl DesktopApp {
         ScrollArea::vertical()
             .id_salt("rule_decision_trace")
             .max_height(360.0)
-            .show(ui, |ui| {
-                for rule in &trace.rules {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.strong(format!("Rule #{} {}", rule.index + 1, rule.rule_name));
-                            let color = match rule.outcome {
-                                RuleTraceOutcome::Matched | RuleTraceOutcome::DefaultFallback => {
-                                    Color32::from_rgb(20, 130, 60)
-                                }
-                                RuleTraceOutcome::NotMatched => Color32::from_rgb(180, 45, 45),
-                                _ => Color32::GRAY,
-                            };
-                            ui.colored_label(color, rule.outcome.label());
-                        });
-                        for condition in &rule.conditions {
-                            let marker = if condition.matched { "✓" } else { "✗" };
-                            let result = if condition.matched {
-                                "matched"
-                            } else {
-                                "mismatch"
-                            };
-                            let color = if condition.matched {
-                                Color32::from_rgb(20, 130, 60)
-                            } else {
-                                Color32::from_rgb(180, 45, 45)
-                            };
-                            ui.colored_label(
-                                color,
-                                format!("{marker} {} {result}", condition.kind.label()),
-                            );
-                            if !condition.matched {
-                                ui.indent((rule.index, condition.kind.label()), |ui| {
-                                    ui.label(format!("Expected: {}", condition.expected));
-                                    ui.label(format!("Actual: {}", condition.actual));
-                                });
-                            }
-                        }
-                    });
-                }
-            });
+            .show(ui, |ui| render_rule_trace(ui, &trace.rules));
         if ui.button("Test live profile route").clicked() {
             self.run_check(self.editor.profile.clone(), connection);
         }
@@ -961,7 +926,7 @@ impl DesktopApp {
     }
 
     fn connections(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Connections");
+        ui.heading("Live Connections");
         ui.label("Local SOCKS5 listener routes configured clients through this profile.");
         ui.horizontal(|ui| {
             ui.label("Listen");
@@ -1029,12 +994,14 @@ impl DesktopApp {
         }
         ui.separator();
         let events = self.service.events();
+        let active_count = events.iter().filter(|event| event.is_active()).count();
         let sent: u64 = events.iter().map(|event| event.sent).sum();
         let received: u64 = events.iter().map(|event| event.received).sum();
         ui.horizontal(|ui| {
-            ui.strong(format!("Connections: {}", events.len()));
+            ui.strong(format!("Active: {active_count}"));
             ui.label(format!(
-                "Retained log — Sent: {} · Received: {}",
+                "Retained: {} · Sent: {} · Received: {}",
+                events.len(),
                 format_bytes(sent),
                 format_bytes(received)
             ));
@@ -1042,8 +1009,9 @@ impl DesktopApp {
         ui.horizontal(|ui| {
             ui.label("Filter");
             ui.text_edit_singleline(&mut self.log_filter);
+            ui.checkbox(&mut self.include_history, "Include history");
             ui.checkbox(&mut self.errors_only, "Errors only");
-            if ui.button("Clear log").clicked() {
+            if ui.button("Clear history").clicked() {
                 self.service.clear_events();
             }
             if ui.button("Export log...").clicked()
@@ -1052,21 +1020,27 @@ impl DesktopApp {
                     .set_file_name("connections.tsv")
                     .save_file()
             {
-                let mut log =
-                    "ID\tApplication\tTarget\tPort\tRule\tAction\tState\tSent\tReceived\tError\n"
-                        .to_owned();
+                let mut log = "ID\tProtocol\tApplication\tPID\tTarget\tPort\tResolved IPs\tInterface\tRule\tAction\tState\tSent\tReceived\tDuration ms\tError\n".to_owned();
                 for event in &events {
                     log.push_str(&format!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
                         event.id,
+                        tsv(&event.protocol),
                         tsv(&event.application),
+                        event.pid.map(|pid| pid.to_string()).unwrap_or_default(),
                         tsv(&event.target),
                         event.port,
+                        tsv(&ip_list(&event.resolved_ips)),
+                        tsv(event.interface_id.as_deref().unwrap_or("")),
                         tsv(&event.rule),
                         tsv(&event.action),
                         tsv(&event.state),
                         event.sent,
                         event.received,
+                        event
+                            .duration()
+                            .map(|duration| duration.as_millis().to_string())
+                            .unwrap_or_default(),
                         tsv(event.error.as_deref().unwrap_or(""))
                     ));
                 }
@@ -1076,8 +1050,30 @@ impl DesktopApp {
                 };
             }
         });
+        let filter = self.log_filter.to_ascii_lowercase();
+        let visible_events = events
+            .iter()
+            .rev()
+            .filter(|event| self.include_history || event.is_active())
+            .filter(|event| !self.errors_only || event.error.is_some())
+            .filter(|event| {
+                filter.is_empty()
+                    || format!(
+                        "{} {} {} {} {} {}",
+                        event.application,
+                        event.pid.map(|pid| pid.to_string()).unwrap_or_default(),
+                        event.target,
+                        event.rule,
+                        event.action,
+                        event.state
+                    )
+                    .to_ascii_lowercase()
+                    .contains(&filter)
+            })
+            .collect::<Vec<_>>();
         ScrollArea::both()
             .id_salt("connection_grid")
+            .max_height(360.0)
             .show(ui, |ui| {
                 egui::Grid::new("events")
                     .striped(true)
@@ -1085,40 +1081,47 @@ impl DesktopApp {
                     .show(ui, |ui| {
                         for label in [
                             "ID",
-                            "Application",
-                            "Target",
-                            "Rule / route",
+                            "Process",
+                            "PID",
+                            "Protocol",
+                            "Destination",
+                            "Route",
                             "State",
-                            "Sent",
-                            "Received",
-                            "Error",
+                            "Up",
+                            "Down",
                         ] {
                             ui.strong(label);
                         }
                         ui.end_row();
-                        let filter = self.log_filter.to_ascii_lowercase();
-                        for event in events.iter().rev().filter(|e| {
-                            (!self.errors_only || e.error.is_some())
-                                && (filter.is_empty()
-                                    || format!(
-                                        "{} {} {} {}",
-                                        e.application, e.target, e.rule, e.state
-                                    )
-                                    .to_ascii_lowercase()
-                                    .contains(&filter))
-                        }) {
-                            ui.label(event.id.to_string());
+                        for event in &visible_events {
+                            if ui
+                                .selectable_label(
+                                    self.selected_connection == Some(event.id),
+                                    event.id.to_string(),
+                                )
+                                .clicked()
+                            {
+                                self.selected_connection = Some(event.id);
+                            }
                             ui.label(&event.application);
+                            ui.label(event.pid.map(|pid| pid.to_string()).unwrap_or_default());
+                            ui.label(&event.protocol);
                             ui.label(format!("{}:{}", event.target, event.port));
-                            ui.label(format!("{} / {}", event.rule, event.action));
+                            ui.label(&event.action);
                             ui.label(&event.state);
                             ui.label(format_bytes(event.sent));
                             ui.label(format_bytes(event.received));
-                            ui.label(event.error.as_deref().unwrap_or(""));
                             ui.end_row();
                         }
                     });
             });
+        if let Some(event) = self
+            .selected_connection
+            .and_then(|id| events.iter().find(|event| event.id == id))
+        {
+            ui.separator();
+            connection_details(ui, event);
+        }
     }
 }
 
@@ -1140,6 +1143,159 @@ fn action_label(action: &Action, routes: &[(Action, String)]) -> String {
             .map(|(_, label)| label.clone())
             .unwrap_or_else(|| format!("Proxy/chain {id}")),
     }
+}
+
+fn render_rule_trace(ui: &mut egui::Ui, rules: &[proxsep_core::rules::RuleTrace]) {
+    for rule in rules {
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.strong(format!("Rule #{} {}", rule.index + 1, rule.rule_name));
+                let color = match rule.outcome {
+                    RuleTraceOutcome::Matched | RuleTraceOutcome::DefaultFallback => {
+                        Color32::from_rgb(20, 130, 60)
+                    }
+                    RuleTraceOutcome::NotMatched => Color32::from_rgb(180, 45, 45),
+                    _ => Color32::GRAY,
+                };
+                ui.colored_label(color, rule.outcome.label());
+            });
+            for condition in &rule.conditions {
+                let marker = if condition.matched { "✓" } else { "✗" };
+                let result = if condition.matched {
+                    "matched"
+                } else {
+                    "mismatch"
+                };
+                let color = if condition.matched {
+                    Color32::from_rgb(20, 130, 60)
+                } else {
+                    Color32::from_rgb(180, 45, 45)
+                };
+                ui.colored_label(
+                    color,
+                    format!("{marker} {} {result}", condition.kind.label()),
+                );
+                if !condition.matched {
+                    ui.indent((rule.index, condition.kind.label()), |ui| {
+                        ui.label(format!("Expected: {}", condition.expected));
+                        ui.label(format!("Actual: {}", condition.actual));
+                    });
+                }
+            }
+        });
+    }
+}
+
+fn ip_list(addresses: &[std::net::IpAddr]) -> String {
+    addresses
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_duration(duration: Duration) -> String {
+    if duration.as_secs() < 1 {
+        format!("{} ms", duration.as_millis())
+    } else if duration.as_secs() < 60 {
+        format!("{:.1} s", duration.as_secs_f64())
+    } else {
+        format!("{:.1} min", duration.as_secs_f64() / 60.0)
+    }
+}
+
+fn connection_details(ui: &mut egui::Ui, event: &ConnectionEvent) {
+    ui.heading(format!("Connection #{}", event.id));
+    egui::Grid::new(("connection_details", event.id))
+        .num_columns(2)
+        .spacing([18.0, 6.0])
+        .show(ui, |ui| {
+            ui.strong("Application");
+            ui.label(&event.application);
+            ui.end_row();
+            ui.strong("PID");
+            ui.label(
+                event
+                    .pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "—".into()),
+            );
+            ui.end_row();
+            ui.strong("Protocol");
+            ui.label(&event.protocol);
+            ui.end_row();
+            ui.strong("State");
+            ui.label(&event.state);
+            ui.end_row();
+            ui.strong("Started");
+            ui.label(
+                event
+                    .started_at
+                    .elapsed()
+                    .map(|elapsed| format!("{} ago", format_duration(elapsed)))
+                    .unwrap_or_else(|_| "just now".into()),
+            );
+            ui.end_row();
+            ui.strong("Duration");
+            ui.label(
+                event
+                    .duration()
+                    .map(format_duration)
+                    .unwrap_or_else(|| "—".into()),
+            );
+            ui.end_row();
+            ui.strong("Traffic");
+            ui.label(format!(
+                "{} sent · {} received",
+                format_bytes(event.sent),
+                format_bytes(event.received)
+            ));
+            ui.end_row();
+            ui.strong("Target");
+            ui.label(format!("{}:{}", event.target, event.port));
+            ui.end_row();
+            ui.strong("Resolved IPs");
+            let resolved = ip_list(&event.resolved_ips);
+            ui.label(if resolved.is_empty() {
+                "—"
+            } else {
+                &resolved
+            });
+            ui.end_row();
+            ui.strong("Connected endpoint");
+            ui.label(
+                event
+                    .destination
+                    .map(|destination| destination.to_string())
+                    .unwrap_or_else(|| "—".into()),
+            );
+            ui.end_row();
+            ui.strong("Interface");
+            ui.label(event.interface_id.as_deref().unwrap_or("—"));
+            ui.end_row();
+            ui.strong("Bind addresses");
+            let bind_ips = ip_list(&event.bind_ips);
+            ui.label(if bind_ips.is_empty() {
+                "—"
+            } else {
+                &bind_ips
+            });
+            ui.end_row();
+            ui.strong("Rule");
+            ui.label(&event.rule);
+            ui.end_row();
+            ui.strong("Action");
+            ui.label(&event.action);
+            ui.end_row();
+            if let Some(error) = &event.error {
+                ui.strong("Error");
+                ui.colored_label(Color32::from_rgb(180, 45, 45), error);
+                ui.end_row();
+            }
+        });
+    egui::CollapsingHeader::new("Decision trace")
+        .default_open(true)
+        .show(ui, |ui| render_rule_trace(ui, &event.rule_trace));
 }
 
 fn format_bytes(bytes: u64) -> String {

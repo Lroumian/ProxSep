@@ -62,6 +62,82 @@ async fn local_socks_listener_routes_and_stops_cleanly() {
 }
 
 #[tokio::test]
+async fn live_connections_expose_context_traffic_and_lifecycle() {
+    let address = echo().await;
+    let runtime = Runtime::new(profile("<Action type=\"Direct\"/>", "", ""));
+    let handle = runtime
+        .start_socks5("127.0.0.1:0", "Wardogs.exe".into())
+        .await
+        .unwrap();
+    let mut client = TcpStream::connect(handle.local_addr()).await.unwrap();
+    proxsep_protocol::socks5::negotiate(&mut client, "127.0.0.1", address.port(), None)
+        .await
+        .unwrap();
+
+    client.write_all(b"ping").await.unwrap();
+    let mut reply = [0; 4];
+    client.read_exact(&mut reply).await.unwrap();
+    let active = runtime.active_connections();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].protocol, "TCP");
+    assert_eq!(active[0].application, "Wardogs.exe");
+    assert!(active[0].is_active());
+    assert!(active[0].started_at.elapsed().is_ok());
+    assert!(active[0].ended_at.is_none());
+    assert!(!active[0].rule_trace.is_empty());
+    assert!(active[0].sent >= 4);
+    assert!(active[0].received >= 4);
+
+    runtime.clear_events();
+    assert_eq!(runtime.active_connections().len(), 1);
+    drop(client);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if runtime.active_connections().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let events = runtime.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].state, "Closed");
+    assert!(events[0].ended_at.is_some());
+    assert!(events[0].duration().is_some());
+
+    runtime.clear_events();
+    assert!(runtime.events().is_empty());
+    handle.stop().await;
+}
+
+#[tokio::test]
+async fn direct_connections_remain_live_until_the_returned_stream_is_dropped() {
+    let address = echo().await;
+    let runtime = Runtime::new(profile("<Action type=\"Direct\"/>", "", ""));
+    let mut stream = runtime
+        .connect(&Connection::new(
+            "direct-client.exe",
+            address.ip().to_string(),
+            address.port(),
+        ))
+        .await
+        .unwrap();
+
+    stream.write_all(b"direct").await.unwrap();
+    let mut reply = [0; 6];
+    stream.read_exact(&mut reply).await.unwrap();
+    assert_eq!(runtime.active_connections().len(), 1);
+    assert!(runtime.active_connections()[0].sent >= 6);
+    assert!(runtime.active_connections()[0].received >= 6);
+    drop(stream);
+    assert!(runtime.active_connections().is_empty());
+    assert_eq!(runtime.events()[0].state, "Closed");
+    assert!(runtime.events()[0].ended_at.is_some());
+}
+
+#[tokio::test]
 async fn redundancy_can_fallback_direct_but_simple_chains_cannot() {
     let address = echo().await;
     let proxies =
