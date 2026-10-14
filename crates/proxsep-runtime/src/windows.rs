@@ -8,14 +8,54 @@
 //! reuse; transparent capture should prefer the kernel EventRecord identity.
 use proxsep_driver::EventRecord;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::net::{TcpSocket, TcpStream};
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+const MAX_PROCESS_LINEAGE: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub parent_pid: Option<u32>,
+    pub executable: String,
+    pub path: Option<String>,
+    pub started_at: Option<SystemTime>,
+}
+
+/// Build a stable root-first lineage from a single process snapshot. Missing
+/// parents end the chain, and PID cycles are bounded instead of looping.
+#[doc(hidden)]
+pub fn process_lineage_from_snapshot(
+    pid: u32,
+    snapshot: &[ProcessIdentity],
+) -> Vec<ProcessIdentity> {
+    let by_pid = snapshot
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut lineage = Vec::new();
+    let mut current = Some(pid);
+    while let Some(pid) = current
+        && lineage.len() < MAX_PROCESS_LINEAGE
+        && seen.insert(pid)
+    {
+        let Some(process) = by_pid.get(&pid) else {
+            break;
+        };
+        lineage.push((*process).clone());
+        current = process.parent_pid.filter(|parent| *parent != pid);
+    }
+    lineage.reverse();
+    lineage
 }
 
 /// Testable synchronous query state machine. Microsoft specifies error122 and
@@ -146,11 +186,19 @@ mod platform {
     };
     use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER, HANDLE},
+        Foundation::{
+            CloseHandle, ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES,
+            FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+        },
         NetworkManagement::{IpHelper::*, Ndis::IfOperStatusUp},
         Networking::WinSock::*,
+        System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        },
         System::Threading::{
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW,
         },
     };
 
@@ -382,12 +430,15 @@ mod platform {
             }
         }
     }
-    fn image(pid: u32) -> io::Result<String> {
+    fn open_process(pid: u32) -> io::Result<Process> {
         // SAFETY: read-only process handle uniquely owned by Process wrapper.
         let process = Process(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) });
         if process.0.is_null() {
             return Err(io::Error::last_os_error());
         }
+        Ok(process)
+    }
+    fn image_from_process(process: &Process) -> io::Result<String> {
         let mut buffer = vec![0u16; 32768];
         let mut length = buffer.len() as u32;
         if unsafe { QueryFullProcessImageNameW(process.0, 0, buffer.as_mut_ptr(), &mut length) }
@@ -400,6 +451,109 @@ mod platform {
         }
         String::from_utf16(&buffer[..length as usize])
             .map_err(|_| invalid("invalid process image UTF-16"))
+    }
+    fn image(pid: u32) -> io::Result<String> {
+        image_from_process(&open_process(pid)?)
+    }
+    fn system_time(filetime: FILETIME) -> Option<SystemTime> {
+        const TICKS_PER_SECOND: u64 = 10_000_000;
+        const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
+        let ticks = ((filetime.dwHighDateTime as u64) << 32) | filetime.dwLowDateTime as u64;
+        let unix_ticks = ticks.checked_sub(UNIX_EPOCH_TICKS)?;
+        Some(
+            UNIX_EPOCH
+                + Duration::new(
+                    unix_ticks / TICKS_PER_SECOND,
+                    ((unix_ticks % TICKS_PER_SECOND) * 100) as u32,
+                ),
+        )
+    }
+    fn started_at(process: &Process) -> io::Result<SystemTime> {
+        let mut created = FILETIME::default();
+        let mut exited = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: all output pointers refer to initialized local FILETIME values
+        // and the read-only process handle remains valid for the call.
+        if unsafe { GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user) }
+            == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        system_time(created).ok_or_else(|| invalid("process time predates Unix epoch"))
+    }
+
+    struct Snapshot(HANDLE);
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn snapshot_processes() -> io::Result<Vec<ProcessIdentity>> {
+        // SAFETY: creates an immutable system snapshot with no borrowed inputs.
+        let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if raw_snapshot == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let snapshot = Snapshot(raw_snapshot);
+        let mut entry = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: entry has the documented size and remains writable.
+        if unsafe { Process32FirstW(snapshot.0, &mut entry) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut processes = Vec::new();
+        loop {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let executable = String::from_utf16(&entry.szExeFile[..end])
+                .unwrap_or_else(|_| "<invalid process name>".into());
+            processes.push(ProcessIdentity {
+                pid: entry.th32ProcessID,
+                parent_pid: (entry.th32ParentProcessID != 0).then_some(entry.th32ParentProcessID),
+                executable,
+                path: None,
+                started_at: None,
+            });
+            if processes.len() >= 65_536 {
+                return Err(invalid("process snapshot exceeds limit"));
+            }
+            // SAFETY: reuses the correctly sized writable entry.
+            if unsafe { Process32NextW(snapshot.0, &mut entry) } == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    break;
+                }
+                return Err(error);
+            }
+        }
+        Ok(processes)
+    }
+
+    pub fn process_lineage(pid: u32) -> io::Result<Vec<ProcessIdentity>> {
+        let snapshot = snapshot_processes()?;
+        let mut lineage = process_lineage_from_snapshot(pid, &snapshot);
+        if lineage.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "process is absent from snapshot",
+            ));
+        }
+        for identity in &mut lineage {
+            if let Ok(process) = open_process(identity.pid) {
+                identity.path = image_from_process(&process).ok();
+                identity.started_at = started_at(&process).ok();
+            }
+        }
+        Ok(lineage)
     }
 
     pub fn identify_client(stream: &TcpStream) -> io::Result<(u32, String)> {
@@ -509,8 +663,8 @@ mod platform {
 
 #[cfg(windows)]
 pub use platform::{
-    identify_client, interfaces, native_app_path_to_dos, redirect_context, redirect_records,
-    set_redirect_records,
+    identify_client, interfaces, native_app_path_to_dos, process_lineage, redirect_context,
+    redirect_records, set_redirect_records,
 };
 
 #[cfg(not(windows))]
@@ -526,6 +680,10 @@ pub fn interfaces() -> io::Result<HashMap<String, Vec<IpAddr>>> {
 }
 #[cfg(not(windows))]
 pub fn identify_client(_: &TcpStream) -> io::Result<(u32, String)> {
+    unsupported()
+}
+#[cfg(not(windows))]
+pub fn process_lineage(_: u32) -> io::Result<Vec<ProcessIdentity>> {
     unsupported()
 }
 #[cfg(not(windows))]

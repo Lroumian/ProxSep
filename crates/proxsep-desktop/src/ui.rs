@@ -5,6 +5,7 @@ use std::{
 };
 
 use eframe::egui::{self, Color32, ComboBox, DragValue, RichText, ScrollArea, TextEdit};
+use proxsep_command::{CommandContext, CommandRegistry};
 use proxsep_core::{
     profile::{Action, Chain, CredentialState, Profile, Proxy, Rule},
     rules::{Connection, RuleEngine, RuleTraceOutcome},
@@ -53,6 +54,7 @@ pub struct DesktopApp {
     check_rx: Option<mpsc::Receiver<String>>,
     async_runtime: tokio::runtime::Runtime,
     service: Arc<Runtime>,
+    commands: CommandRegistry,
     listener: Option<ListenerHandle>,
     start_rx: Option<mpsc::Receiver<Result<ListenerHandle, String>>>,
     listen_address: String,
@@ -100,6 +102,7 @@ impl DesktopApp {
             check_rx: None,
             async_runtime: tokio::runtime::Runtime::new().expect("network runtime"),
             service: Runtime::new(new_profile()),
+            commands: CommandRegistry::standard(),
             listener: None,
             start_rx: None,
             listen_address: "127.0.0.1:1080".into(),
@@ -133,6 +136,32 @@ impl DesktopApp {
             }
             Err(error) => self.status = format!("Open failed: {error}"),
         }
+    }
+
+    fn execute_runtime_command(
+        &self,
+        command: &str,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.commands
+            .execute(
+                &CommandContext {
+                    runtime: Some(Arc::clone(&self.service)),
+                },
+                command,
+                arguments,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn apply_runtime_profile(&self) -> Result<(), String> {
+        let xml = self
+            .editor
+            .profile
+            .to_xml()
+            .map_err(|error| error.to_string())?;
+        self.execute_runtime_command("runtime.profile.replace", serde_json::json!({ "xml": xml }))?;
+        Ok(())
     }
 
     fn save_profile(&mut self, save_as: bool) -> bool {
@@ -976,14 +1005,18 @@ impl DesktopApp {
                 self.status = "Listener stopped".into();
             }
             if ui.button("Apply profile").clicked() {
-                self.status = match self.service.replace_profile(self.editor.profile.clone()) {
+                self.status = match self.apply_runtime_profile() {
                     Ok(()) => "Runtime profile updated for new connections".into(),
                     Err(e) => format!("Invalid profile: {e}"),
                 };
             }
             if ui.button("Reset failed proxies").clicked() {
-                self.service.reset_failures();
-                self.status = "Proxy failure and affinity state reset".into();
+                self.status = match self
+                    .execute_runtime_command("runtime.failure.reset", serde_json::json!({}))
+                {
+                    Ok(_) => "Proxy failure and affinity state reset".into(),
+                    Err(error) => format!("Reset failed: {error}"),
+                };
             }
         });
         if let Some(listener) = &self.listener {
@@ -1012,7 +1045,16 @@ impl DesktopApp {
             ui.checkbox(&mut self.include_history, "Include history");
             ui.checkbox(&mut self.errors_only, "Errors only");
             if ui.button("Clear history").clicked() {
-                self.service.clear_events();
+                self.status = match self.execute_runtime_command(
+                    "runtime.connection.history_clear",
+                    serde_json::json!({}),
+                ) {
+                    Ok(result) => format!(
+                        "Cleared {} completed connections",
+                        result["removed"].as_u64().unwrap_or_default()
+                    ),
+                    Err(error) => format!("Clear history failed: {error}"),
+                };
             }
             if ui.button("Export log...").clicked()
                 && let Some(path) = rfd::FileDialog::new()

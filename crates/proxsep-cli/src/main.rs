@@ -1,10 +1,11 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    io::{BufRead, Write},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use proxsep_core::{
-    profile::Profile,
-    rules::{Connection, RuleEngine},
-};
+use proxsep_core::{profile::Profile, rules::Connection};
 use tokio::{
     io::copy_bidirectional,
     net::{TcpListener, TcpStream},
@@ -23,6 +24,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Discover or invoke the shared UI/CLI/JSON/MCP command catalog.
+    #[command(name = "command")]
+    Shared {
+        #[command(subcommand)]
+        action: SharedCommand,
+    },
     /// Use our already-loaded independent driver. Never installs/loads a driver or changes DNS settings.
     Transparent {
         profile: PathBuf,
@@ -106,6 +113,25 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SharedCommand {
+    /// List machine-readable command descriptors.
+    List,
+    /// Describe one command, including its input/output JSON Schema.
+    Describe { id: String },
+    /// Execute one JSON request envelope.
+    Invoke {
+        request: String,
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
+    /// Execute newline-delimited JSON requests with one persistent context.
+    Stream {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
+}
+
 #[cfg(test)]
 mod branding_tests {
     use super::{Cli, Command};
@@ -162,6 +188,23 @@ mod branding_tests {
             vec!["192.0.2.10".parse::<std::net::IpAddr>().unwrap()]
         );
     }
+
+    #[test]
+    fn shared_command_adapter_exposes_list_describe_invoke_and_stream() {
+        for arguments in [
+            vec!["proxsep", "command", "list"],
+            vec!["proxsep", "command", "describe", "route.trace"],
+            vec![
+                "proxsep",
+                "command",
+                "invoke",
+                r#"{"command":"system.command.count","arguments":{}}"#,
+            ],
+            vec!["proxsep", "command", "stream"],
+        ] {
+            assert!(Cli::try_parse_from(arguments).is_ok());
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -173,6 +216,7 @@ enum ProxyProtocol {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
+        Command::Shared { action } => run_shared_command(action)?,
         Command::Transparent {
             profile,
             ipv4_listen,
@@ -279,7 +323,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::ExportProfile { profile, output } => {
             let xml = load_profile(&profile)?.to_xml()?;
             // Never overwrite a destination implicitly.
-            use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -296,13 +339,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Command::CheckProfile { profile } => {
-            let profile = load_profile(&profile)?;
+            let xml = std::fs::read_to_string(profile)?;
+            let registry = proxsep_command::CommandRegistry::standard();
+            let summary = registry.execute(
+                &proxsep_command::CommandContext::default(),
+                "profile.summary",
+                serde_json::json!({ "xml": xml }),
+            )?;
             println!(
                 "valid Proxifier profile v{}: {} proxies, {} chains, {} rules",
-                profile.version,
-                profile.proxies.len(),
-                profile.chains.len(),
-                profile.rules.len()
+                summary["version"], summary["proxies"], summary["chains"], summary["rules"]
             );
         }
         Command::Route {
@@ -316,19 +362,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interface_ips,
             trace,
         } => {
-            let profile = load_profile(&profile)?;
-            let mut connection = Connection::new(app, host, port);
-            connection.pid = pid;
-            connection.resolved_ips = resolved_ips;
+            let xml = std::fs::read_to_string(profile)?;
+            let mut interfaces = serde_json::Map::new();
             if let Some(interface) = interface {
-                connection.interfaces.insert(interface, interface_ips);
+                interfaces.insert(interface, serde_json::json!(interface_ips));
             }
-            let engine = RuleEngine::new(&profile.rules);
+            let registry = proxsep_command::CommandRegistry::standard();
+            let command = if trace { "route.trace" } else { "route.decide" };
+            let result = registry.execute(
+                &proxsep_command::CommandContext::default(),
+                command,
+                serde_json::json!({
+                    "xml": xml,
+                    "application": app,
+                    "target": host,
+                    "port": port,
+                    "pid": pid,
+                    "resolved_ips": resolved_ips,
+                    "interfaces": interfaces
+                }),
+            )?;
             if trace {
-                print!("{}", engine.trace(&connection).render_text(&connection));
+                print!("{}", result["text"].as_str().unwrap_or_default());
             } else {
-                let decision = engine.decide(&connection);
-                println!("{}: {:?}", decision.rule_name, decision.action);
+                println!(
+                    "{}: {}",
+                    result["rule"].as_str().unwrap_or("<unknown>"),
+                    result["action"].as_str().unwrap_or("<unknown>")
+                );
             }
         }
         Command::Tunnel {
@@ -390,6 +451,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    Ok(())
+}
+
+fn run_shared_command(action: SharedCommand) -> Result<(), Box<dyn std::error::Error>> {
+    use proxsep_command::CommandRegistry;
+
+    let registry = CommandRegistry::standard();
+    match action {
+        SharedCommand::List => {
+            write_json(&registry.descriptors())?;
+        }
+        SharedCommand::Describe { id } => {
+            let Some(descriptor) = registry.descriptor(&id) else {
+                return Err(format!("unknown command: {id}").into());
+            };
+            write_json(descriptor)?;
+        }
+        SharedCommand::Invoke { request, profile } => {
+            let context = command_context(profile)?;
+            write_json(&registry.execute_json(&context, &request))?;
+        }
+        SharedCommand::Stream { profile } => {
+            let context = command_context(profile)?;
+            let stdin = std::io::stdin();
+            let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
+            for line in stdin.lock().lines() {
+                let response = registry.execute_json(&context, &line?);
+                serde_json::to_writer(&mut stdout, &response)?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn command_context(
+    profile: Option<PathBuf>,
+) -> Result<proxsep_command::CommandContext, Box<dyn std::error::Error>> {
+    Ok(proxsep_command::CommandContext {
+        runtime: profile
+            .as_ref()
+            .map(load_profile)
+            .transpose()?
+            .map(proxsep_runtime::Runtime::new),
+    })
+}
+
+fn write_json(value: &impl serde::Serialize) -> Result<(), Box<dyn std::error::Error>> {
+    let stdout = std::io::stdout();
+    let mut stdout = std::io::BufWriter::new(stdout.lock());
+    serde_json::to_writer_pretty(&mut stdout, value)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
     Ok(())
 }
 

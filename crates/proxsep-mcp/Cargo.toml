@@ -1,0 +1,16 @@
+[package]
+name = "proxsep-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "proxsep-mcp"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+proxsep-command = { path = "../proxsep-command" }
+proxsep-core = { path = "../proxsep-core" }
+proxsep-runtime = { path = "../proxsep-runtime" }
+serde_json.workspace = true

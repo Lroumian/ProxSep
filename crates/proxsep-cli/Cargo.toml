@@ -11,7 +11,10 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 proxsep-core = { path = "../proxsep-core" }
+proxsep-command = { path = "../proxsep-command" }
 proxsep-protocol = { path = "../proxsep-protocol" }
 proxsep-runtime = { path = "../proxsep-runtime" }
+serde_json.workspace = true
+serde.workspace = true
 proxsep-driver = { path = "../proxsep-driver" }
 tokio.workspace = true

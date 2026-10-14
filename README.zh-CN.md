@@ -83,6 +83,7 @@ ProxSep 不是为了逐像素复刻其他产品，而是一个独立实现的 Ru
 - CLI：配置校验、路由评估、服务启动、透明模式。
 - Windows Service / 控制台守护进程。
 - 实时连接视图：活动/历史筛选、生命周期状态、流量计数、路由上下文与逐连接规则轨迹。
+- 桌面、CLI、JSON Lines 与 stdio MCP 共用带 Schema 的命令注册表；参见 [命令架构](COMMANDS.md)。
 - 代理连通性检查。
 - PPX v100–102 导入与回写。
 - 支持嵌套认证、Windows 当前账户 DPAPI 凭据、代理链、DNS/接口配置。
@@ -231,6 +232,7 @@ cargo run -p proxsep-cli -- transparent 'C:\Profiles\Profile.ppx'
 - [ ] QUIC-aware Flow Metadata
 - [ ] REST API
 - [ ] WebSocket 事件流
+- [x] UI / CLI / JSON / MCP 统一命令基础
 - [ ] 动态策略与条件故障转移
 - [ ] 机器可读的规则诊断结果
 

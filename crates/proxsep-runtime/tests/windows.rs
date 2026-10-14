@@ -1,5 +1,43 @@
 use proxsep_driver::EventRecord;
-use proxsep_runtime::windows::{decode_application_id, parse_event_destination};
+use proxsep_runtime::windows::{
+    ProcessIdentity, decode_application_id, parse_event_destination, process_lineage_from_snapshot,
+};
+
+#[test]
+fn process_lineage_is_root_first_and_bounded_by_cycles_or_missing_parents() {
+    let process = |pid, parent_pid, executable: &str| ProcessIdentity {
+        pid,
+        parent_pid,
+        executable: executable.into(),
+        path: None,
+        started_at: None,
+    };
+    let snapshot = vec![
+        process(40, Some(30), "game.exe"),
+        process(10, None, "explorer.exe"),
+        process(30, Some(20), "launcher.exe"),
+        process(20, Some(10), "steam.exe"),
+    ];
+    assert_eq!(
+        process_lineage_from_snapshot(40, &snapshot)
+            .iter()
+            .map(|process| process.pid)
+            .collect::<Vec<_>>(),
+        vec![10, 20, 30, 40]
+    );
+
+    let cycle = vec![
+        process(1, Some(2), "one.exe"),
+        process(2, Some(1), "two.exe"),
+    ];
+    let lineage = process_lineage_from_snapshot(1, &cycle);
+    assert_eq!(lineage.len(), 2);
+    assert_eq!(lineage.last().unwrap().pid, 1);
+
+    let missing = vec![process(8, Some(99), "orphan.exe")];
+    assert_eq!(process_lineage_from_snapshot(8, &missing), missing);
+    assert!(process_lineage_from_snapshot(404, &snapshot).is_empty());
+}
 #[test]
 fn native_path_mapping_is_case_insensitive_longest_and_component_bounded() {
     use proxsep_runtime::windows::map_native_app_path;
@@ -167,4 +205,24 @@ async fn ipv6_reverse_tuple_and_active_interfaces() {
     let adapters = proxsep_runtime::windows::interfaces().unwrap();
     assert!(adapters.values().flatten().any(|ip| ip.is_loopback()));
     drop(client);
+}
+
+#[cfg(windows)]
+#[test]
+fn current_process_lineage_has_stable_identity_metadata() {
+    let lineage = proxsep_runtime::windows::process_lineage(std::process::id()).unwrap();
+    let current = lineage.last().unwrap();
+    assert_eq!(current.pid, std::process::id());
+    assert!(
+        current
+            .path
+            .as_ref()
+            .is_some_and(|path| path.ends_with(".exe"))
+    );
+    assert!(
+        current
+            .started_at
+            .is_some_and(|started| started.elapsed().is_ok())
+    );
+    assert!(lineage.len() <= 64);
 }

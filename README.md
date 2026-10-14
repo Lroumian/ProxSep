@@ -73,6 +73,7 @@ Packet inspection is intentionally out of scope for the core project. Dedicated 
 - CLI for validation, rule evaluation, serving, and transparent mode.
 - Windows Service / console daemon.
 - Live connection view with active/history filtering, lifecycle state, byte counters, route context, and per-connection rule traces.
+- Shared schema-backed command registry used by the desktop, CLI, JSON Lines, and stdio MCP adapters; see [command architecture](COMMANDS.md).
 - Proxy connectivity checks.
 - PPX v100–102 import/write support, including nested authentication, Windows account-bound DPAPI credentials, chains, DNS/interface configuration, and preservation of unknown extension fields.
 
@@ -219,6 +220,7 @@ The transparent listener only accepts sockets backed by ProxSep WFP context/reco
 - [ ] QUIC-aware flow metadata.
 - [ ] REST API.
 - [ ] WebSocket event stream.
+- [x] Shared UI / CLI / JSON / MCP command foundation.
 - [ ] Dynamic policy and failover conditions.
 - [ ] Scriptable / machine-readable rule diagnostics.
 

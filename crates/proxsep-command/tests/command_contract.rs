@@ -1,0 +1,162 @@
+use std::collections::HashSet;
+
+use proxsep_command::{CommandContext, CommandRequest, CommandSurface};
+use proxsep_core::profile::Profile;
+use serde_json::json;
+
+#[test]
+fn standard_catalog_is_unique_schema_backed_and_shared_by_every_surface() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    assert!(
+        registry.len() >= 12,
+        "the first catalog slice must be useful"
+    );
+    let descriptors = registry.descriptors();
+    let ids = descriptors
+        .iter()
+        .map(|descriptor| descriptor.id.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(ids.len(), descriptors.len());
+    for descriptor in descriptors {
+        assert!(
+            descriptor
+                .id
+                .chars()
+                .all(|character| character.is_ascii_lowercase()
+                    || character == '.'
+                    || character == '_')
+        );
+        assert_eq!(
+            descriptor.surfaces,
+            vec![
+                CommandSurface::Ui,
+                CommandSurface::Cli,
+                CommandSurface::Json,
+                CommandSurface::Mcp,
+            ]
+        );
+        assert!(descriptor.input_schema.is_object());
+        assert!(descriptor.output_schema.is_object());
+    }
+}
+
+#[test]
+fn profile_and_route_commands_execute_through_the_same_json_contract() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    let xml = include_str!("../../proxsep-core/tests/fixtures/default.ppx");
+    let summary = registry
+        .execute(
+            &CommandContext::default(),
+            "profile.summary",
+            json!({ "xml": xml }),
+        )
+        .unwrap();
+    assert_eq!(summary["version"], 102);
+    assert_eq!(summary["rules"], 2);
+
+    let route = registry
+        .execute(
+            &CommandContext::default(),
+            "route.decide",
+            json!({
+                "xml": xml,
+                "application": "browser.exe",
+                "target": "example.com",
+                "port": 443
+            }),
+        )
+        .unwrap();
+    assert!(route["rule"].is_string());
+    assert!(route["action"].is_string());
+}
+
+#[test]
+fn request_envelope_preserves_identity_and_stable_errors() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    let response = registry.execute_request(
+        &CommandContext::default(),
+        CommandRequest {
+            request_id: Some("automation-42".into()),
+            command: "missing.command".into(),
+            arguments: json!({}),
+        },
+    );
+    assert_eq!(response.request_id.as_deref(), Some("automation-42"));
+    assert_eq!(response.command, "missing.command");
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().code, "unknown_command");
+
+    let malformed = registry.execute_json(&CommandContext::default(), "not json");
+    assert!(!malformed.ok);
+    assert_eq!(malformed.error.unwrap().code, "invalid_request");
+
+    let unknown_envelope_field = registry.execute_json(
+        &CommandContext::default(),
+        r#"{"command":"system.command.count","unexpected":true}"#,
+    );
+    assert!(!unknown_envelope_field.ok);
+    assert_eq!(
+        unknown_envelope_field.error.unwrap().code,
+        "invalid_request"
+    );
+
+    let extra = registry.execute_request(
+        &CommandContext::default(),
+        CommandRequest {
+            request_id: None,
+            command: "system.command.count".into(),
+            arguments: json!({ "ignored": true }),
+        },
+    );
+    assert!(!extra.ok);
+    assert_eq!(extra.error.unwrap().code, "invalid_arguments");
+}
+
+#[test]
+fn catalog_can_describe_itself_through_a_normal_command() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    let listed = registry
+        .execute(&CommandContext::default(), "system.command.list", json!({}))
+        .unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), registry.len());
+    let described = registry
+        .execute(
+            &CommandContext::default(),
+            "system.command.describe",
+            json!({ "id": "route.trace" }),
+        )
+        .unwrap();
+    assert_eq!(described["id"], "route.trace");
+    let describe_command = registry.descriptor("system.command.describe").unwrap();
+    assert!(describe_command.input_schema["properties"]["id"].is_object());
+    assert!(describe_command.input_schema["properties"]["field"].is_null());
+}
+
+#[test]
+fn runtime_commands_share_one_explicit_context() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    let missing = registry.execute_request(
+        &CommandContext::default(),
+        CommandRequest {
+            request_id: None,
+            command: "runtime.connection.list".into(),
+            arguments: json!({}),
+        },
+    );
+    assert_eq!(missing.error.unwrap().code, "runtime_required");
+
+    let xml = include_str!("../../proxsep-core/tests/fixtures/default.ppx");
+    let profile = Profile::from_xml_for_current_user(xml).unwrap();
+    let context = CommandContext {
+        runtime: Some(proxsep_runtime::Runtime::new(profile)),
+    };
+    let applied = registry
+        .execute(&context, "runtime.profile.replace", json!({ "xml": xml }))
+        .unwrap();
+    assert_eq!(applied["applied"], true);
+
+    let connections = registry
+        .execute(&context, "runtime.connection.list", json!({}))
+        .unwrap();
+    assert_eq!(connections, json!([]));
+}
