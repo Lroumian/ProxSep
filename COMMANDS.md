@@ -76,8 +76,14 @@ The implemented catalog includes discovery, PPX validation/summary/normalizing,
 all modeled profile-option reads and validated writes, credential-safe proxy
 inventory and lifecycle operations, proxy endpoints and credential state,
 proxy-chain inventory/lifecycle/member ordering and field editing, reference
-analysis, route decision/trace, process lineage, retained/active connections,
-history cleanup, failure reset, runtime profile replacement, and DNS
-observation/reverse fake-IP lookup. The registry is the authoritative source
-for the exact current count; documentation must not hard-code it as if the
-608-command target were already complete.
+analysis, complete rule inventory/lifecycle/priority control, rule field editing,
+validated direct/block/proxy/chain actions, route decision/trace, process
+lineage, retained/active connections, history cleanup, failure reset, runtime
+profile replacement, and DNS observation/reverse fake-IP lookup.
+
+Rule commands keep the fallback rule structurally safe: custom rules are
+inserted ahead of `Default`, priority commands cannot move `Default`, and only
+its routing action can be changed. Rule mutations return normalized profile XML
+so every adapter observes the same validated result. The registry is the
+authoritative source for the exact current count; documentation must not
+hard-code it as if the 608-command target were already complete.

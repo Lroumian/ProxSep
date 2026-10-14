@@ -715,3 +715,466 @@ fn chain_lifecycle_and_member_commands_preserve_order_and_references() {
     );
     assert_eq!(referenced.error.unwrap().code, "conflict");
 }
+
+#[test]
+fn rule_catalog_exposes_real_inventory_field_and_action_commands() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    assert!(registry.len() >= 142);
+    let expected = [
+        "rule.list",
+        "rule.get",
+        "rule.count",
+        "rule.field.list",
+        "rule.enabled.get",
+        "rule.enabled.set",
+        "rule.name.get",
+        "rule.name.set",
+        "rule.applications.get",
+        "rule.applications.set",
+        "rule.targets.get",
+        "rule.targets.set",
+        "rule.ports.get",
+        "rule.ports.set",
+        "rule.action.get",
+        "rule.action.set",
+        "rule.interface_id.get",
+        "rule.interface_id.set",
+        "rule.skip_if_interface_down.get",
+        "rule.skip_if_interface_down.set",
+        "rule.action.kind.list",
+        "rule.create",
+        "rule.delete",
+        "rule.duplicate",
+        "rule.move",
+        "rule.enable",
+        "rule.disable",
+        "rule.priority.first",
+        "rule.priority.last",
+        "rule.priority.up",
+        "rule.priority.down",
+        "rule.action.direct",
+        "rule.action.block",
+        "rule.action.proxy",
+        "rule.action.chain",
+    ];
+    for id in expected {
+        assert!(registry.descriptor(id).is_some(), "missing {id}");
+    }
+
+    let fields = registry
+        .execute(&CommandContext::default(), "rule.field.list", json!({}))
+        .unwrap();
+    assert_eq!(fields.as_array().unwrap().len(), 8);
+    assert_eq!(fields[0]["field"], "enabled");
+    assert_eq!(fields[7]["field"], "skip_if_interface_down");
+
+    let kinds = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.action.kind.list",
+            json!({}),
+        )
+        .unwrap();
+    assert_eq!(kinds, json!(["direct", "block", "proxy", "chain"]));
+
+    let xml = include_str!("../../proxsep-core/tests/fixtures/default.ppx");
+    let fetched = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.get",
+            json!({ "xml": xml, "index": 0 }),
+        )
+        .unwrap();
+    assert_eq!(fetched["name"], "Localhost");
+    assert_eq!(fetched["index"], 0);
+    let count = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.count",
+            json!({ "xml": xml }),
+        )
+        .unwrap();
+    assert_eq!(
+        count,
+        json!({ "count": 2, "custom_count": 1, "default_index": 1 })
+    );
+}
+
+#[test]
+fn every_rule_field_round_trips_through_validated_profile_xml() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    let xml = profile_with_chain();
+    let cases = [
+        ("enabled", json!(false)),
+        ("name", json!("Web Browsers")),
+        ("applications", json!("browser.exe; helper.exe")),
+        ("targets", json!("example.com; *.internal")),
+        ("ports", json!("80; 443; 8000-8100")),
+        ("action", json!({ "kind": "proxy", "id": 1 })),
+        ("interface_id", json!("ethernet-1")),
+        ("skip_if_interface_down", json!(true)),
+    ];
+
+    for (field, replacement) in cases {
+        let get_id = format!("rule.{field}.get");
+        let set_id = format!("rule.{field}.set");
+        assert!(registry.descriptor(&get_id).is_some(), "missing {get_id}");
+        assert!(registry.descriptor(&set_id).is_some(), "missing {set_id}");
+
+        let changed = registry
+            .execute(
+                &CommandContext::default(),
+                &set_id,
+                json!({ "xml": xml, "index": 0, "value": replacement }),
+            )
+            .unwrap();
+        let read = registry
+            .execute(
+                &CommandContext::default(),
+                &get_id,
+                json!({ "xml": changed["xml"], "index": 0 }),
+            )
+            .unwrap();
+        assert_eq!(read["value"], replacement, "{set_id} did not persist");
+    }
+
+    for field in ["applications", "targets", "ports"] {
+        let changed = registry
+            .execute(
+                &CommandContext::default(),
+                &format!("rule.{field}.set"),
+                json!({ "xml": xml, "index": 0, "value": "Any" }),
+            )
+            .unwrap();
+        assert_eq!(changed["value"], "");
+    }
+}
+
+#[test]
+fn rule_lifecycle_preserves_the_default_fallback_and_custom_order() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    let base = profile_with_chain();
+    let created = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.create",
+            json!({
+                "xml": base,
+                "name": "Web",
+                "applications": "browser.exe",
+                "action": { "kind": "block" }
+            }),
+        )
+        .unwrap();
+    assert_eq!(created["rule"]["index"], 1);
+    assert_eq!(created["rule"]["name"], "Web");
+
+    let created_xml = created["xml"].as_str().unwrap();
+    let listed = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.list",
+            json!({ "xml": created_xml }),
+        )
+        .unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 3);
+    assert_eq!(listed[0]["name"], "Localhost");
+    assert_eq!(listed[1]["name"], "Web");
+    assert_eq!(listed[2]["name"], "Default");
+
+    let duplicated = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.duplicate",
+            json!({ "xml": created_xml, "index": 1 }),
+        )
+        .unwrap();
+    assert_eq!(duplicated["rule"]["index"], 2);
+    assert_eq!(duplicated["rule"]["name"], "Copy of Web");
+
+    let disabled = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.disable",
+            json!({ "xml": duplicated["xml"], "index": 1 }),
+        )
+        .unwrap();
+    assert_eq!(disabled["rule"]["enabled"], false);
+    let enabled = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.enable",
+            json!({ "xml": disabled["xml"], "index": 1 }),
+        )
+        .unwrap();
+    assert_eq!(enabled["rule"]["enabled"], true);
+
+    let moved = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.move",
+            json!({ "xml": enabled["xml"], "from_index": 2, "to_index": 0 }),
+        )
+        .unwrap();
+    assert_eq!(moved["rule"]["index"], 0);
+    assert_eq!(moved["rule"]["name"], "Copy of Web");
+
+    let deleted = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.delete",
+            json!({ "xml": moved["xml"], "index": 0 }),
+        )
+        .unwrap();
+    assert_eq!(deleted["deleted"]["name"], "Copy of Web");
+    let after_delete = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.list",
+            json!({ "xml": deleted["xml"] }),
+        )
+        .unwrap();
+    assert_eq!(after_delete[2]["name"], "Default");
+
+    for command in ["rule.delete", "rule.duplicate", "rule.disable"] {
+        let response = registry.execute_request(
+            &CommandContext::default(),
+            CommandRequest {
+                request_id: None,
+                command: command.into(),
+                arguments: json!({ "xml": deleted["xml"], "index": 2 }),
+            },
+        );
+        assert_eq!(response.error.unwrap().code, "conflict", "{command}");
+    }
+
+    let reserved_name = registry.execute_request(
+        &CommandContext::default(),
+        CommandRequest {
+            request_id: None,
+            command: "rule.create".into(),
+            arguments: json!({
+                "xml": base,
+                "name": "Default",
+                "action": { "kind": "direct" }
+            }),
+        },
+    );
+    assert_eq!(reserved_name.error.unwrap().code, "conflict");
+}
+
+#[test]
+fn rule_priority_commands_never_move_the_default_rule() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    let base = include_str!("../../proxsep-core/tests/fixtures/default.ppx");
+    let a = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.create",
+            json!({ "xml": base, "name": "A", "action": { "kind": "direct" } }),
+        )
+        .unwrap();
+    let b = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.create",
+            json!({ "xml": a["xml"], "name": "B", "action": { "kind": "direct" } }),
+        )
+        .unwrap();
+
+    let first = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.priority.first",
+            json!({ "xml": b["xml"], "index": 2 }),
+        )
+        .unwrap();
+    assert_eq!(first["rule"]["index"], 0);
+    let last = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.priority.last",
+            json!({ "xml": first["xml"], "index": 0 }),
+        )
+        .unwrap();
+    assert_eq!(last["rule"]["index"], 2);
+    let up = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.priority.up",
+            json!({ "xml": last["xml"], "index": 2 }),
+        )
+        .unwrap();
+    assert_eq!(up["rule"]["index"], 1);
+    let down = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.priority.down",
+            json!({ "xml": up["xml"], "index": 1 }),
+        )
+        .unwrap();
+    assert_eq!(down["rule"]["index"], 2);
+
+    let listed = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.list",
+            json!({ "xml": down["xml"] }),
+        )
+        .unwrap();
+    assert_eq!(listed[3]["name"], "Default");
+
+    for (command, index) in [("rule.priority.up", 0), ("rule.priority.down", 2)] {
+        let response = registry.execute_request(
+            &CommandContext::default(),
+            CommandRequest {
+                request_id: None,
+                command: command.into(),
+                arguments: json!({ "xml": down["xml"], "index": index }),
+            },
+        );
+        assert_eq!(response.error.unwrap().code, "conflict", "{command}");
+    }
+}
+
+#[test]
+fn rule_action_commands_validate_references_and_allow_default_action_edits() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    let xml = profile_with_chain();
+    let cases = [
+        (
+            "rule.action.direct",
+            json!({ "xml": xml, "index": 0 }),
+            json!({ "kind": "direct" }),
+        ),
+        (
+            "rule.action.block",
+            json!({ "xml": xml, "index": 0 }),
+            json!({ "kind": "block" }),
+        ),
+        (
+            "rule.action.proxy",
+            json!({ "xml": xml, "index": 0, "proxy_id": 1 }),
+            json!({ "kind": "proxy", "id": 1 }),
+        ),
+        (
+            "rule.action.chain",
+            json!({ "xml": xml, "index": 0, "chain_id": 10 }),
+            json!({ "kind": "chain", "id": 10 }),
+        ),
+    ];
+    for (command, arguments, expected) in cases {
+        let changed = registry
+            .execute(&CommandContext::default(), command, arguments)
+            .unwrap();
+        assert_eq!(changed["rule"]["action"], expected, "{command}");
+    }
+
+    let default_changed = registry
+        .execute(
+            &CommandContext::default(),
+            "rule.action.block",
+            json!({ "xml": xml, "index": 1 }),
+        )
+        .unwrap();
+    assert_eq!(default_changed["rule"]["name"], "Default");
+    assert_eq!(
+        default_changed["rule"]["action"],
+        json!({ "kind": "block" })
+    );
+
+    let forbidden_default_edit = registry.execute_request(
+        &CommandContext::default(),
+        CommandRequest {
+            request_id: None,
+            command: "rule.name.set".into(),
+            arguments: json!({ "xml": xml, "index": 1, "value": "Fallback" }),
+        },
+    );
+    assert_eq!(forbidden_default_edit.error.unwrap().code, "conflict");
+
+    for (command, arguments) in [
+        (
+            "rule.action.proxy",
+            json!({ "xml": xml, "index": 0, "proxy_id": 99 }),
+        ),
+        (
+            "rule.action.chain",
+            json!({ "xml": xml, "index": 0, "chain_id": 99 }),
+        ),
+    ] {
+        let response = registry.execute_request(
+            &CommandContext::default(),
+            CommandRequest {
+                request_id: None,
+                command: command.into(),
+                arguments,
+            },
+        );
+        assert_eq!(response.error.unwrap().code, "not_found", "{command}");
+    }
+}
+
+#[test]
+fn rule_commands_reject_malformed_edits_and_out_of_range_indices() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    let xml = profile_with_chain();
+    let cases = [
+        (
+            "rule.ports.set",
+            json!({ "xml": xml, "index": 0, "value": "443-bad" }),
+            "invalid_arguments",
+        ),
+        (
+            "rule.action.proxy",
+            json!({ "xml": xml, "index": 0, "proxy_id": 0 }),
+            "invalid_arguments",
+        ),
+        (
+            "rule.action.chain",
+            json!({ "xml": xml, "index": 0, "chain_id": 0 }),
+            "invalid_arguments",
+        ),
+        (
+            "rule.enabled.set",
+            json!({ "xml": xml, "index": 1, "value": false }),
+            "conflict",
+        ),
+        (
+            "rule.move",
+            json!({ "xml": xml, "from_index": 1, "to_index": 0 }),
+            "conflict",
+        ),
+        ("rule.get", json!({ "xml": xml, "index": 99 }), "not_found"),
+        (
+            "rule.create",
+            json!({ "xml": xml, "name": "   ", "action": { "kind": "direct" } }),
+            "invalid_arguments",
+        ),
+        (
+            "rule.action.set",
+            json!({ "xml": xml, "index": 0, "value": { "kind": "direct", "id": 1 } }),
+            "invalid_arguments",
+        ),
+        (
+            "rule.get",
+            json!({ "xml": xml, "index": 0, "unexpected": true }),
+            "invalid_arguments",
+        ),
+    ];
+    for (command, arguments, expected_code) in cases {
+        let response = registry.execute_request(
+            &CommandContext::default(),
+            CommandRequest {
+                request_id: None,
+                command: command.into(),
+                arguments,
+            },
+        );
+        assert_eq!(
+            response.error.unwrap().code,
+            expected_code,
+            "{command} returned the wrong error"
+        );
+    }
+}

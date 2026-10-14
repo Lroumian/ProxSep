@@ -7,7 +7,7 @@ use std::{
 };
 
 use proxsep_core::{
-    profile::{Action, CredentialState, Profile},
+    profile::{Action, CredentialState, Profile, Rule},
     rules::{Connection, RuleEngine},
 };
 use proxsep_runtime::Runtime;
@@ -174,6 +174,100 @@ const CHAIN_FIELDS: [ChainField; 9] = [
     ChainField::RedundancyRecheckTime,
     ChainField::LoadBalancingSameProxyForPid,
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleField {
+    Enabled,
+    Name,
+    Applications,
+    Targets,
+    Ports,
+    Action,
+    InterfaceId,
+    SkipIfInterfaceDown,
+}
+
+const RULE_FIELDS: [RuleField; 8] = [
+    RuleField::Enabled,
+    RuleField::Name,
+    RuleField::Applications,
+    RuleField::Targets,
+    RuleField::Ports,
+    RuleField::Action,
+    RuleField::InterfaceId,
+    RuleField::SkipIfInterfaceDown,
+];
+
+impl RuleField {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Enabled => "enabled",
+            Self::Name => "name",
+            Self::Applications => "applications",
+            Self::Targets => "targets",
+            Self::Ports => "ports",
+            Self::Action => "action",
+            Self::InterfaceId => "interface_id",
+            Self::SkipIfInterfaceDown => "skip_if_interface_down",
+        }
+    }
+
+    fn value_schema(self) -> Value {
+        match self {
+            Self::Enabled | Self::SkipIfInterfaceDown => json!({ "type": "boolean" }),
+            Self::Name => json!({ "type": "string", "minLength": 1 }),
+            Self::Applications | Self::Targets | Self::Ports | Self::InterfaceId => {
+                json!({ "type": "string" })
+            }
+            Self::Action => rule_action_schema(),
+        }
+    }
+
+    fn value(self, rule: &Rule) -> Value {
+        match self {
+            Self::Enabled => json!(rule.enabled),
+            Self::Name => json!(rule.name),
+            Self::Applications => json!(rule.applications),
+            Self::Targets => json!(rule.targets),
+            Self::Ports => json!(rule.ports),
+            Self::Action => rule_action_value(&rule.action),
+            Self::InterfaceId => json!(rule.interface_id),
+            Self::SkipIfInterfaceDown => json!(rule.skip_if_interface_down),
+        }
+    }
+
+    fn set(self, rule: &mut Rule, value: Value) -> Result<(), CommandError> {
+        let invalid_type = || {
+            CommandError::InvalidArguments(format!(
+                "value for rule.{} has the wrong type or range",
+                self.id()
+            ))
+        };
+        match self {
+            Self::Enabled => rule.enabled = value.as_bool().ok_or_else(invalid_type)?,
+            Self::Name => {
+                let name = value.as_str().ok_or_else(invalid_type)?;
+                if name.trim().is_empty() {
+                    return Err(invalid_type());
+                }
+                rule.name = name.to_owned();
+            }
+            Self::Applications => {
+                rule.applications = normalize_any(value.as_str().ok_or_else(invalid_type)?)
+            }
+            Self::Targets => rule.targets = normalize_any(value.as_str().ok_or_else(invalid_type)?),
+            Self::Ports => rule.ports = normalize_any(value.as_str().ok_or_else(invalid_type)?),
+            Self::Action => rule.action = rule_action_from_value(value)?,
+            Self::InterfaceId => {
+                rule.interface_id = value.as_str().ok_or_else(invalid_type)?.to_owned()
+            }
+            Self::SkipIfInterfaceDown => {
+                rule.skip_if_interface_down = value.as_bool().ok_or_else(invalid_type)?
+            }
+        }
+        Ok(())
+    }
+}
 
 impl ChainField {
     fn id(self) -> &'static str {
@@ -498,6 +592,8 @@ enum CommandHandler {
     ProxyFieldSet(ProxyField),
     ChainFieldGet(ChainField),
     ChainFieldSet(ChainField),
+    RuleFieldGet(RuleField),
+    RuleFieldSet(RuleField),
 }
 
 struct RegisteredCommand {
@@ -933,6 +1029,188 @@ impl CommandRegistry {
                 handler,
             );
         }
+        for (id, summary, handler) in [
+            (
+                "rule.list",
+                "List configured routing rules in evaluation order",
+                rule_list as Handler,
+            ),
+            (
+                "rule.get",
+                "Read one routing rule by its stable list index",
+                rule_get as Handler,
+            ),
+            (
+                "rule.count",
+                "Count custom and default routing rules",
+                rule_count as Handler,
+            ),
+        ] {
+            registry.register(
+                descriptor(
+                    id,
+                    "rule",
+                    summary,
+                    CommandRisk::ReadOnly,
+                    if id == "rule.get" {
+                        profile_index_schema()
+                    } else {
+                        required_string_schema("xml")
+                    },
+                    schema(if id == "rule.list" { "array" } else { "object" }),
+                ),
+                handler,
+            );
+        }
+        registry.register(
+            descriptor(
+                "rule.field.list",
+                "rule",
+                "List editable routing-rule fields and value schemas",
+                CommandRisk::ReadOnly,
+                empty_schema(),
+                schema("array"),
+            ),
+            rule_field_list,
+        );
+        for field in RULE_FIELDS {
+            let get_id = format!("rule.{}.get", field.id());
+            let set_id = format!("rule.{}.set", field.id());
+            registry.register_handler(
+                descriptor(
+                    &get_id,
+                    "rule",
+                    &format!("Read routing-rule field {}", field.id()),
+                    CommandRisk::ReadOnly,
+                    profile_index_schema(),
+                    rule_field_output_schema(field, false),
+                ),
+                CommandHandler::RuleFieldGet(field),
+            );
+            registry.register_handler(
+                descriptor(
+                    &set_id,
+                    "rule",
+                    &format!(
+                        "Set routing-rule field {} and return validated XML",
+                        field.id()
+                    ),
+                    CommandRisk::Mutating,
+                    rule_field_set_schema(field),
+                    rule_field_output_schema(field, true),
+                ),
+                CommandHandler::RuleFieldSet(field),
+            );
+        }
+        registry.register(
+            descriptor(
+                "rule.action.kind.list",
+                "rule",
+                "List supported routing-rule action kinds",
+                CommandRisk::ReadOnly,
+                empty_schema(),
+                schema("array"),
+            ),
+            rule_action_kind_list,
+        );
+        for (id, summary, input_schema, handler) in [
+            (
+                "rule.create",
+                "Create a validated rule immediately before the Default fallback",
+                rule_create_schema(),
+                rule_create as Handler,
+            ),
+            (
+                "rule.delete",
+                "Delete a custom routing rule",
+                profile_index_schema(),
+                rule_delete as Handler,
+            ),
+            (
+                "rule.duplicate",
+                "Clone a custom rule immediately after its source",
+                profile_index_schema(),
+                rule_duplicate as Handler,
+            ),
+            (
+                "rule.move",
+                "Move a custom rule without moving the Default fallback",
+                rule_move_schema(),
+                rule_move as Handler,
+            ),
+            (
+                "rule.enable",
+                "Enable a custom routing rule",
+                profile_index_schema(),
+                rule_enable as Handler,
+            ),
+            (
+                "rule.disable",
+                "Disable a custom routing rule",
+                profile_index_schema(),
+                rule_disable as Handler,
+            ),
+            (
+                "rule.priority.first",
+                "Move a custom rule to the highest priority",
+                profile_index_schema(),
+                rule_priority_first as Handler,
+            ),
+            (
+                "rule.priority.last",
+                "Move a custom rule immediately before the Default fallback",
+                profile_index_schema(),
+                rule_priority_last as Handler,
+            ),
+            (
+                "rule.priority.up",
+                "Move a custom rule one priority higher",
+                profile_index_schema(),
+                rule_priority_up as Handler,
+            ),
+            (
+                "rule.priority.down",
+                "Move a custom rule one priority lower",
+                profile_index_schema(),
+                rule_priority_down as Handler,
+            ),
+            (
+                "rule.action.direct",
+                "Set a rule action to direct connection",
+                profile_index_schema(),
+                rule_action_direct as Handler,
+            ),
+            (
+                "rule.action.block",
+                "Set a rule action to block the connection",
+                profile_index_schema(),
+                rule_action_block as Handler,
+            ),
+            (
+                "rule.action.proxy",
+                "Set a rule action to a configured proxy",
+                rule_action_reference_schema("proxy_id"),
+                rule_action_proxy as Handler,
+            ),
+            (
+                "rule.action.chain",
+                "Set a rule action to a configured proxy chain",
+                rule_action_reference_schema("chain_id"),
+                rule_action_chain as Handler,
+            ),
+        ] {
+            registry.register(
+                descriptor(
+                    id,
+                    "rule",
+                    summary,
+                    CommandRisk::Mutating,
+                    input_schema,
+                    schema("object"),
+                ),
+                handler,
+            );
+        }
         registry.register(
             descriptor(
                 "route.decide",
@@ -1094,6 +1372,8 @@ impl CommandRegistry {
             CommandHandler::ProxyFieldSet(field) => proxy_field_set(*field, arguments),
             CommandHandler::ChainFieldGet(field) => chain_field_get(*field, arguments),
             CommandHandler::ChainFieldSet(field) => chain_field_set(*field, arguments),
+            CommandHandler::RuleFieldGet(field) => rule_field_get(*field, arguments),
+            CommandHandler::RuleFieldSet(field) => rule_field_set(*field, arguments),
         }
     }
 
@@ -1465,6 +1745,135 @@ fn chain_member_move_schema() -> Value {
     })
 }
 
+fn rule_action_schema() -> Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "const": "direct" } },
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "required": ["kind"],
+                "properties": { "kind": { "const": "block" } },
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "required": ["kind", "id"],
+                "properties": {
+                    "kind": { "const": "proxy" },
+                    "id": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 }
+                },
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "required": ["kind", "id"],
+                "properties": {
+                    "kind": { "const": "chain" },
+                    "id": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 }
+                },
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
+fn profile_index_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "index"],
+        "properties": {
+            "xml": { "type": "string" },
+            "index": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn rule_field_set_schema(field: RuleField) -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "index", "value"],
+        "properties": {
+            "xml": { "type": "string" },
+            "index": { "type": "integer", "minimum": 0 },
+            "value": field.value_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn rule_field_output_schema(field: RuleField, include_xml: bool) -> Value {
+    let mut required = vec![json!("index"), json!("field"), json!("value")];
+    let mut properties = serde_json::Map::from_iter([
+        ("index".into(), json!({ "type": "integer", "minimum": 0 })),
+        (
+            "field".into(),
+            json!({ "type": "string", "const": field.id() }),
+        ),
+        ("value".into(), field.value_schema()),
+    ]);
+    if include_xml {
+        required.push(json!("xml"));
+        properties.insert("xml".into(), json!({ "type": "string" }));
+    }
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": properties,
+        "additionalProperties": false
+    })
+}
+
+fn rule_create_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "name", "action"],
+        "properties": {
+            "xml": { "type": "string" },
+            "enabled": { "type": "boolean" },
+            "name": { "type": "string", "minLength": 1 },
+            "applications": { "type": "string" },
+            "targets": { "type": "string" },
+            "ports": { "type": "string" },
+            "action": rule_action_schema(),
+            "interface_id": { "type": "string" },
+            "skip_if_interface_down": { "type": "boolean" }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn rule_move_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "from_index", "to_index"],
+        "properties": {
+            "xml": { "type": "string" },
+            "from_index": { "type": "integer", "minimum": 0 },
+            "to_index": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn rule_action_reference_schema(field: &str) -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "index", field],
+        "properties": {
+            "xml": { "type": "string" },
+            "index": { "type": "integer", "minimum": 0 },
+            (field): { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 }
+        },
+        "additionalProperties": false
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyArguments {}
@@ -1579,6 +1988,65 @@ struct ChainMemberMoveArguments {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ProfileIndexArguments {
+    xml: String,
+    index: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileIndexValueArguments {
+    xml: String,
+    index: usize,
+    value: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleCreateArguments {
+    xml: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    name: String,
+    #[serde(default)]
+    applications: String,
+    #[serde(default)]
+    targets: String,
+    #[serde(default)]
+    ports: String,
+    action: Value,
+    #[serde(default)]
+    interface_id: String,
+    #[serde(default)]
+    skip_if_interface_down: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleMoveArguments {
+    xml: String,
+    from_index: usize,
+    to_index: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleProxyActionArguments {
+    xml: String,
+    index: usize,
+    proxy_id: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuleChainActionArguments {
+    xml: String,
+    index: usize,
+    chain_id: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RouteArguments {
     xml: String,
     application: String,
@@ -1608,6 +2076,10 @@ struct IpArguments {
 #[serde(deny_unknown_fields)]
 struct AvailabilityArguments {
     available: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn arguments<T: DeserializeOwned>(value: Value) -> Result<T, CommandError> {
@@ -2573,6 +3045,486 @@ fn chain_member_move(
     let proxy_id = chain.proxy_ids.remove(input.from_index);
     chain.proxy_ids.insert(input.to_index, proxy_id);
     chain_mutation_output(&profile, index)
+}
+
+fn normalize_any(value: &str) -> String {
+    if value.trim().eq_ignore_ascii_case("any") {
+        String::new()
+    } else {
+        value.to_owned()
+    }
+}
+
+fn rule_action_from_value(value: Value) -> Result<Action, CommandError> {
+    let invalid = || {
+        CommandError::InvalidArguments(
+            "rule action must be direct, block, proxy with id, or chain with id".into(),
+        )
+    };
+    let object = value.as_object().ok_or_else(invalid)?;
+    let kind = object
+        .get("kind")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    match kind {
+        "direct" if object.len() == 1 => Ok(Action::Direct),
+        "block" if object.len() == 1 => Ok(Action::Block),
+        "proxy" | "chain" if object.len() == 2 => {
+            let id = object
+                .get("id")
+                .and_then(Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok())
+                .filter(|id| *id != 0)
+                .ok_or_else(invalid)?;
+            if kind == "proxy" {
+                Ok(Action::Proxy(id.to_string()))
+            } else {
+                Ok(Action::Chain(id.to_string()))
+            }
+        }
+        _ => Err(invalid()),
+    }
+}
+
+fn rule_action_value(action: &Action) -> Value {
+    match action {
+        Action::Direct => json!({ "kind": "direct" }),
+        Action::Block => json!({ "kind": "block" }),
+        Action::Proxy(id) => id.parse::<u32>().map_or_else(
+            |_| json!({ "kind": "proxy", "id": id }),
+            |id| json!({ "kind": "proxy", "id": id }),
+        ),
+        Action::Chain(id) => id.parse::<u32>().map_or_else(
+            |_| json!({ "kind": "chain", "id": id }),
+            |id| json!({ "kind": "chain", "id": id }),
+        ),
+    }
+}
+
+fn rule_value(rule: &Rule, index: usize) -> Value {
+    json!({
+        "index": index,
+        "enabled": rule.enabled,
+        "name": rule.name,
+        "applications": rule.applications,
+        "targets": rule.targets,
+        "ports": rule.ports,
+        "action": rule_action_value(&rule.action),
+        "interface_id": rule.interface_id,
+        "skip_if_interface_down": rule.skip_if_interface_down,
+        "is_default": rule.name == "Default"
+    })
+}
+
+fn rule_index(profile: &Profile, index: usize) -> Result<usize, CommandError> {
+    if index >= profile.rules.len() {
+        return Err(CommandError::NotFound(format!("rule index {index}")));
+    }
+    Ok(index)
+}
+
+fn default_rule_index(profile: &Profile) -> Result<usize, CommandError> {
+    let mut defaults = profile
+        .rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.name == "Default")
+        .map(|(index, _)| index);
+    let index = defaults
+        .next()
+        .ok_or_else(|| CommandError::Conflict("profile must contain one Default rule".into()))?;
+    if defaults.next().is_some() {
+        return Err(CommandError::Conflict(
+            "profile cannot contain multiple Default rules".into(),
+        ));
+    }
+    if index + 1 != profile.rules.len() {
+        return Err(CommandError::Conflict(
+            "Default rule must be last in evaluation order".into(),
+        ));
+    }
+    Ok(index)
+}
+
+fn custom_rule_index(profile: &Profile, index: usize) -> Result<usize, CommandError> {
+    let index = rule_index(profile, index)?;
+    if index == default_rule_index(profile)? {
+        return Err(CommandError::Conflict(
+            "Default rule only permits action changes".into(),
+        ));
+    }
+    Ok(index)
+}
+
+fn validate_rule_action(profile: &Profile, action: &Action) -> Result<(), CommandError> {
+    match action {
+        Action::Proxy(id) => {
+            let id = id
+                .parse::<u32>()
+                .map_err(|_| CommandError::InvalidArguments("invalid proxy action ID".into()))?;
+            if !profile.proxies.iter().any(|proxy| proxy.id == id) {
+                return Err(CommandError::NotFound(format!("proxy {id}")));
+            }
+        }
+        Action::Chain(id) => {
+            let id = id
+                .parse::<u32>()
+                .map_err(|_| CommandError::InvalidArguments("invalid chain action ID".into()))?;
+            if !profile.chains.iter().any(|chain| chain.id == id) {
+                return Err(CommandError::NotFound(format!("chain {id}")));
+            }
+        }
+        Action::Direct | Action::Block => {}
+    }
+    Ok(())
+}
+
+fn rule_mutation_output(profile: &Profile, index: usize) -> Result<Value, CommandError> {
+    default_rule_index(profile)?;
+    let index = rule_index(profile, index)?;
+    let rule = rule_value(&profile.rules[index], index);
+    let xml = validated_profile_xml(profile)?;
+    Ok(json!({ "rule": rule, "xml": xml }))
+}
+
+fn rule_list(_: &CommandRegistry, _: &CommandContext, value: Value) -> Result<Value, CommandError> {
+    let input: ProfileArguments = arguments(value)?;
+    let profile = profile(&input.xml)?;
+    Ok(Value::Array(
+        profile
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| rule_value(rule, index))
+            .collect(),
+    ))
+}
+
+fn rule_get(_: &CommandRegistry, _: &CommandContext, value: Value) -> Result<Value, CommandError> {
+    let input: ProfileIndexArguments = arguments(value)?;
+    let profile = profile(&input.xml)?;
+    let index = rule_index(&profile, input.index)?;
+    Ok(rule_value(&profile.rules[index], index))
+}
+
+fn rule_count(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProfileArguments = arguments(value)?;
+    let profile = profile(&input.xml)?;
+    let default_index = default_rule_index(&profile)?;
+    Ok(json!({
+        "count": profile.rules.len(),
+        "custom_count": profile.rules.len() - 1,
+        "default_index": default_index
+    }))
+}
+
+fn rule_field_list(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    no_arguments(value)?;
+    Ok(Value::Array(
+        RULE_FIELDS
+            .into_iter()
+            .map(|field| {
+                json!({
+                    "field": field.id(),
+                    "value_schema": field.value_schema(),
+                    "get_command": format!("rule.{}.get", field.id()),
+                    "set_command": format!("rule.{}.set", field.id())
+                })
+            })
+            .collect(),
+    ))
+}
+
+fn rule_field_get(field: RuleField, value: Value) -> Result<Value, CommandError> {
+    let input: ProfileIndexArguments = arguments(value)?;
+    let profile = profile(&input.xml)?;
+    let index = rule_index(&profile, input.index)?;
+    Ok(json!({
+        "index": index,
+        "field": field.id(),
+        "value": field.value(&profile.rules[index])
+    }))
+}
+
+fn rule_field_set(field: RuleField, value: Value) -> Result<Value, CommandError> {
+    let input: ProfileIndexValueArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = rule_index(&profile, input.index)?;
+    let default_index = default_rule_index(&profile)?;
+    if index == default_index && field != RuleField::Action {
+        return Err(CommandError::Conflict(
+            "Default rule only permits action changes".into(),
+        ));
+    }
+    if field == RuleField::Name && input.value.as_str().is_some_and(|name| name == "Default") {
+        return Err(CommandError::Conflict(
+            "Default is a reserved rule name".into(),
+        ));
+    }
+    if field == RuleField::Action {
+        let action = rule_action_from_value(input.value)?;
+        validate_rule_action(&profile, &action)?;
+        profile.rules[index].action = action;
+    } else {
+        field.set(&mut profile.rules[index], input.value)?;
+    }
+    let value = field.value(&profile.rules[index]);
+    let xml = validated_profile_xml(&profile)?;
+    Ok(json!({ "index": index, "field": field.id(), "value": value, "xml": xml }))
+}
+
+fn rule_action_kind_list(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    no_arguments(value)?;
+    Ok(json!(["direct", "block", "proxy", "chain"]))
+}
+
+fn rule_create(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: RuleCreateArguments = arguments(value)?;
+    if input.name.trim().is_empty() {
+        return Err(CommandError::InvalidArguments(
+            "rule name cannot be empty".into(),
+        ));
+    }
+    if input.name == "Default" {
+        return Err(CommandError::Conflict(
+            "Default is a reserved rule name".into(),
+        ));
+    }
+    let mut profile = profile(&input.xml)?;
+    let index = default_rule_index(&profile)?;
+    let action = rule_action_from_value(input.action)?;
+    validate_rule_action(&profile, &action)?;
+    profile.rules.insert(
+        index,
+        Rule {
+            enabled: input.enabled,
+            name: input.name,
+            applications: normalize_any(&input.applications),
+            targets: normalize_any(&input.targets),
+            ports: normalize_any(&input.ports),
+            action,
+            interface_id: input.interface_id,
+            skip_if_interface_down: input.skip_if_interface_down,
+            original_element: None,
+        },
+    );
+    rule_mutation_output(&profile, index)
+}
+
+fn rule_delete(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProfileIndexArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = custom_rule_index(&profile, input.index)?;
+    let deleted = profile.rules.remove(index);
+    let xml = validated_profile_xml(&profile)?;
+    Ok(json!({ "deleted": rule_value(&deleted, index), "xml": xml }))
+}
+
+fn rule_duplicate(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProfileIndexArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = custom_rule_index(&profile, input.index)?;
+    let mut duplicate = profile.rules[index].clone();
+    duplicate.name = format!("Copy of {}", duplicate.name);
+    let new_index = index + 1;
+    profile.rules.insert(new_index, duplicate);
+    rule_mutation_output(&profile, new_index)
+}
+
+fn move_custom_rule(
+    profile: &mut Profile,
+    from_index: usize,
+    to_index: usize,
+) -> Result<usize, CommandError> {
+    let from_index = custom_rule_index(profile, from_index)?;
+    let default_index = default_rule_index(profile)?;
+    if to_index >= default_index {
+        return Err(CommandError::Conflict(
+            "custom rules cannot move after the Default rule".into(),
+        ));
+    }
+    if from_index != to_index {
+        let rule = profile.rules.remove(from_index);
+        profile.rules.insert(to_index, rule);
+    }
+    Ok(to_index)
+}
+
+fn rule_move(_: &CommandRegistry, _: &CommandContext, value: Value) -> Result<Value, CommandError> {
+    let input: RuleMoveArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = move_custom_rule(&mut profile, input.from_index, input.to_index)?;
+    rule_mutation_output(&profile, index)
+}
+
+fn set_rule_enabled(value: Value, enabled: bool) -> Result<Value, CommandError> {
+    let input: ProfileIndexArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = custom_rule_index(&profile, input.index)?;
+    profile.rules[index].enabled = enabled;
+    rule_mutation_output(&profile, index)
+}
+
+fn rule_enable(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    set_rule_enabled(value, true)
+}
+
+fn rule_disable(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    set_rule_enabled(value, false)
+}
+
+fn move_rule_to_priority(
+    value: Value,
+    target: fn(usize, usize) -> Option<usize>,
+) -> Result<Value, CommandError> {
+    let input: ProfileIndexArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = custom_rule_index(&profile, input.index)?;
+    let default_index = default_rule_index(&profile)?;
+    let to_index = target(index, default_index).ok_or_else(|| {
+        CommandError::Conflict("rule is already at the requested priority boundary".into())
+    })?;
+    let index = move_custom_rule(&mut profile, index, to_index)?;
+    rule_mutation_output(&profile, index)
+}
+
+fn rule_priority_first(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    move_rule_to_priority(value, |index, _| (index != 0).then_some(0))
+}
+
+fn rule_priority_last(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    move_rule_to_priority(value, |index, default_index| {
+        let last = default_index.checked_sub(1)?;
+        (index != last).then_some(last)
+    })
+}
+
+fn rule_priority_up(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    move_rule_to_priority(value, |index, _| index.checked_sub(1))
+}
+
+fn rule_priority_down(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    move_rule_to_priority(value, |index, default_index| {
+        (index + 1 < default_index).then_some(index + 1)
+    })
+}
+
+fn set_rule_action(value: Value, action: Action) -> Result<Value, CommandError> {
+    let input: ProfileIndexArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = rule_index(&profile, input.index)?;
+    default_rule_index(&profile)?;
+    validate_rule_action(&profile, &action)?;
+    profile.rules[index].action = action;
+    rule_mutation_output(&profile, index)
+}
+
+fn rule_action_direct(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    set_rule_action(value, Action::Direct)
+}
+
+fn rule_action_block(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    set_rule_action(value, Action::Block)
+}
+
+fn rule_action_proxy(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: RuleProxyActionArguments = arguments(value)?;
+    let RuleProxyActionArguments {
+        xml,
+        index,
+        proxy_id,
+    } = input;
+    if proxy_id == 0 {
+        return Err(CommandError::InvalidArguments(
+            "proxy ID must be non-zero".into(),
+        ));
+    }
+    set_rule_action(
+        json!({ "xml": xml, "index": index }),
+        Action::Proxy(proxy_id.to_string()),
+    )
+}
+
+fn rule_action_chain(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: RuleChainActionArguments = arguments(value)?;
+    let RuleChainActionArguments {
+        xml,
+        index,
+        chain_id,
+    } = input;
+    if chain_id == 0 {
+        return Err(CommandError::InvalidArguments(
+            "chain ID must be non-zero".into(),
+        ));
+    }
+    set_rule_action(
+        json!({ "xml": xml, "index": index }),
+        Action::Chain(chain_id.to_string()),
+    )
 }
 
 fn connection(input: RouteArguments) -> Result<(Profile, Connection), CommandError> {
