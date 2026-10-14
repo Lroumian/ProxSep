@@ -378,3 +378,340 @@ fn proxy_field_commands_round_trip_validated_profile_xml() {
     );
     assert_eq!(missing.error.unwrap().code, "not_found");
 }
+
+fn profile_with_chain() -> String {
+    profile_with_proxy()
+        .replace(
+            "</ProxyList>",
+            r#"    <Proxy id="2" type="SOCKS5">
+      <Address>192.0.2.2</Address><Port>1081</Port><Label>Backup</Label>
+      <UserAgent></UserAgent><Options>0</Options>
+    </Proxy>
+  </ProxyList>"#,
+        )
+        .replace(
+            "<ChainList />",
+            r#"<ChainList>
+    <Chain id="10" type="simple">
+      <Name>Main Chain</Name><Proxy enabled="true">1</Proxy><Proxy enabled="true">2</Proxy>
+      <RedundancyTimeout>10</RedundancyTimeout><RedundancyTryDirect>false</RedundancyTryDirect>
+      <RedundancyRecheck>true</RedundancyRecheck><RedundancyRecheckTime>60</RedundancyRecheckTime>
+      <LoadBalancingSameProxyForPid>false</LoadBalancingSameProxyForPid>
+    </Chain>
+  </ChainList>"#,
+        )
+}
+
+#[test]
+fn chain_inventory_ids_and_references_use_the_validated_profile_model() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    assert!(registry.len() >= 89);
+    let xml = profile_with_chain();
+
+    let listed = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.list",
+            json!({ "xml": xml }),
+        )
+        .unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_eq!(listed[0]["id"], 10);
+    assert_eq!(listed[0]["proxy_ids"], json!([1, 2]));
+    let fetched = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.get",
+            json!({ "xml": xml, "id": 10 }),
+        )
+        .unwrap();
+    assert_eq!(fetched["name"], "Main Chain");
+    let count = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.count",
+            json!({ "xml": xml }),
+        )
+        .unwrap();
+    assert_eq!(count["count"], 1);
+    let next = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.id.next",
+            json!({ "xml": xml }),
+        )
+        .unwrap();
+    assert_eq!(next["id"], 3);
+    let proxy_next = registry
+        .execute(
+            &CommandContext::default(),
+            "proxy.id.next",
+            json!({ "xml": xml }),
+        )
+        .unwrap();
+    assert_eq!(proxy_next["id"], 3);
+    let references = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.references",
+            json!({ "xml": xml, "id": 10 }),
+        )
+        .unwrap();
+    assert_eq!(references["rules"], json!([]));
+}
+
+#[test]
+fn every_chain_field_has_real_get_and_set_commands() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    let xml = profile_with_chain();
+    let cases = [
+        ("name", json!("Failover")),
+        ("kind", json!("redundancy")),
+        ("proxy_ids", json!([2, 1])),
+        ("disabled_proxy_ids", json!([2])),
+        ("redundancy_timeout", json!(25)),
+        ("redundancy_try_direct", json!(true)),
+        ("redundancy_recheck", json!(false)),
+        ("redundancy_recheck_time", json!(120)),
+        ("load_balancing_same_proxy_for_pid", json!(true)),
+    ];
+    for (field, replacement) in cases {
+        let get_id = format!("chain.{field}.get");
+        let set_id = format!("chain.{field}.set");
+        assert!(registry.descriptor(&get_id).is_some(), "missing {get_id}");
+        assert!(registry.descriptor(&set_id).is_some(), "missing {set_id}");
+        let changed = registry
+            .execute(
+                &CommandContext::default(),
+                &set_id,
+                json!({ "xml": xml, "id": 10, "value": replacement }),
+            )
+            .unwrap();
+        let read = registry
+            .execute(
+                &CommandContext::default(),
+                &get_id,
+                json!({ "xml": changed["xml"], "id": 10 }),
+            )
+            .unwrap();
+        assert_eq!(read["value"], replacement, "{set_id} did not persist");
+    }
+
+    let invalid = registry.execute_request(
+        &CommandContext::default(),
+        CommandRequest {
+            request_id: None,
+            command: "chain.disabled_proxy_ids.set".into(),
+            arguments: json!({ "xml": xml, "id": 10, "value": [99] }),
+        },
+    );
+    assert!(!invalid.ok);
+    assert_eq!(invalid.error.unwrap().code, "invalid_arguments");
+}
+
+#[test]
+fn proxy_lifecycle_endpoint_and_credential_commands_are_safe() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    assert!(registry.len() >= 98);
+    let base = include_str!("../../proxsep-core/tests/fixtures/default.ppx");
+
+    let protocols = registry
+        .execute(&CommandContext::default(), "proxy.protocol.list", json!({}))
+        .unwrap();
+    assert_eq!(protocols.as_array().unwrap().len(), 5);
+
+    let created = registry
+        .execute(
+            &CommandContext::default(),
+            "proxy.create",
+            json!({
+                "xml": base,
+                "protocol": "SOCKS5",
+                "address": "proxy.example",
+                "port": 1080,
+                "label": "Primary"
+            }),
+        )
+        .unwrap();
+    assert_eq!(created["proxy"]["id"], 1);
+    let created_xml = created["xml"].as_str().unwrap();
+
+    let endpoint = registry
+        .execute(
+            &CommandContext::default(),
+            "proxy.endpoint.get",
+            json!({ "xml": created_xml, "id": 1 }),
+        )
+        .unwrap();
+    assert_eq!(endpoint["address"], "proxy.example");
+    assert_eq!(endpoint["port"], 1080);
+    let changed = registry
+        .execute(
+            &CommandContext::default(),
+            "proxy.endpoint.set",
+            json!({ "xml": created_xml, "id": 1, "address": "proxy.internal", "port": 8443 }),
+        )
+        .unwrap();
+    assert_eq!(changed["address"], "proxy.internal");
+    assert_eq!(changed["port"], 8443);
+
+    let duplicated = registry
+        .execute(
+            &CommandContext::default(),
+            "proxy.duplicate",
+            json!({ "xml": changed["xml"], "id": 1 }),
+        )
+        .unwrap();
+    assert_eq!(duplicated["proxy"]["id"], 2);
+    assert_eq!(duplicated["credentials_copied"], false);
+    let deleted = registry
+        .execute(
+            &CommandContext::default(),
+            "proxy.delete",
+            json!({ "xml": duplicated["xml"], "id": 2 }),
+        )
+        .unwrap();
+    assert_eq!(deleted["deleted"]["id"], 2);
+
+    let referenced = registry.execute_request(
+        &CommandContext::default(),
+        CommandRequest {
+            request_id: None,
+            command: "proxy.delete".into(),
+            arguments: json!({ "xml": profile_with_chain(), "id": 1 }),
+        },
+    );
+    assert_eq!(referenced.error.unwrap().code, "conflict");
+
+    let protected = profile_with_proxy();
+    let status = registry
+        .execute(
+            &CommandContext::default(),
+            "proxy.credentials.status",
+            json!({ "xml": protected, "id": 1 }),
+        )
+        .unwrap();
+    assert_eq!(status["has_username"], true);
+    assert_eq!(status["has_password"], true);
+    assert_eq!(status["password_protected"], true);
+    assert!(status.get("username").is_none());
+    assert!(status.get("password").is_none());
+
+    let cleared = registry
+        .execute(
+            &CommandContext::default(),
+            "proxy.credentials.clear",
+            json!({ "xml": protected, "id": 1 }),
+        )
+        .unwrap();
+    assert_eq!(cleared["has_username"], false);
+    assert_eq!(cleared["has_password"], false);
+
+    let plaintext = protected.replace("mode=\"basic\"", "mode=\"disabled\"");
+    let credentials = registry
+        .execute(
+            &CommandContext::default(),
+            "proxy.credentials.set",
+            json!({ "xml": plaintext, "id": 1, "username": "bob", "password": "new-secret" }),
+        )
+        .unwrap();
+    assert_eq!(credentials["has_username"], true);
+    assert_eq!(credentials["has_password"], true);
+    assert!(credentials.get("username").is_none());
+    assert!(credentials.get("password").is_none());
+}
+
+#[test]
+fn chain_lifecycle_and_member_commands_preserve_order_and_references() {
+    let registry = proxsep_command::CommandRegistry::standard();
+    assert!(registry.len() >= 107);
+    let xml = profile_with_chain();
+
+    let kinds = registry
+        .execute(&CommandContext::default(), "chain.kind.list", json!({}))
+        .unwrap();
+    assert_eq!(kinds, json!(["simple", "redundancy", "load_balancing"]));
+
+    let created = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.create",
+            json!({ "xml": xml, "name": "New Chain", "kind": "simple", "proxy_ids": [1] }),
+        )
+        .unwrap();
+    assert_eq!(created["chain"]["id"], 3);
+    let duplicated = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.duplicate",
+            json!({ "xml": xml, "id": 10 }),
+        )
+        .unwrap();
+    assert_eq!(duplicated["chain"]["id"], 3);
+    assert_eq!(duplicated["chain"]["name"], "Main Chain Copy");
+
+    let removed = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.member.remove",
+            json!({ "xml": xml, "id": 10, "proxy_id": 2 }),
+        )
+        .unwrap();
+    assert_eq!(removed["chain"]["proxy_ids"], json!([1]));
+    let added = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.member.add",
+            json!({ "xml": removed["xml"], "id": 10, "proxy_id": 2, "position": 0 }),
+        )
+        .unwrap();
+    assert_eq!(added["chain"]["proxy_ids"], json!([2, 1]));
+    let disabled = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.member.disable",
+            json!({ "xml": added["xml"], "id": 10, "proxy_id": 2 }),
+        )
+        .unwrap();
+    assert_eq!(disabled["chain"]["disabled_proxy_ids"], json!([2]));
+    let enabled = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.member.enable",
+            json!({ "xml": disabled["xml"], "id": 10, "proxy_id": 2 }),
+        )
+        .unwrap();
+    assert_eq!(enabled["chain"]["disabled_proxy_ids"], json!([]));
+    let moved = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.member.move",
+            json!({ "xml": enabled["xml"], "id": 10, "from_index": 0, "to_index": 1 }),
+        )
+        .unwrap();
+    assert_eq!(moved["chain"]["proxy_ids"], json!([1, 2]));
+
+    let deleted = registry
+        .execute(
+            &CommandContext::default(),
+            "chain.delete",
+            json!({ "xml": xml, "id": 10 }),
+        )
+        .unwrap();
+    assert_eq!(deleted["deleted"]["id"], 10);
+
+    let referenced_xml = xml.replacen(
+        "<Action type=\"Direct\" />",
+        "<Action type=\"Chain\">10</Action>",
+        1,
+    );
+    let referenced = registry.execute_request(
+        &CommandContext::default(),
+        CommandRequest {
+            request_id: None,
+            command: "chain.delete".into(),
+            arguments: json!({ "xml": referenced_xml, "id": 10 }),
+        },
+    );
+    assert_eq!(referenced.error.unwrap().code, "conflict");
+}

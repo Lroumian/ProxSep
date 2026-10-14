@@ -81,6 +81,8 @@ pub enum CommandError {
     RuntimeRequired,
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("command failed: {0}")]
     Failed(String),
 }
@@ -147,6 +149,135 @@ const PROXY_FIELDS: [ProxyField; 6] = [
     ProxyField::UserAgent,
     ProxyField::Options,
 ];
+
+#[derive(Debug, Clone, Copy)]
+enum ChainField {
+    Name,
+    Kind,
+    ProxyIds,
+    DisabledProxyIds,
+    RedundancyTimeout,
+    RedundancyTryDirect,
+    RedundancyRecheck,
+    RedundancyRecheckTime,
+    LoadBalancingSameProxyForPid,
+}
+
+const CHAIN_FIELDS: [ChainField; 9] = [
+    ChainField::Name,
+    ChainField::Kind,
+    ChainField::ProxyIds,
+    ChainField::DisabledProxyIds,
+    ChainField::RedundancyTimeout,
+    ChainField::RedundancyTryDirect,
+    ChainField::RedundancyRecheck,
+    ChainField::RedundancyRecheckTime,
+    ChainField::LoadBalancingSameProxyForPid,
+];
+
+impl ChainField {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Name => "name",
+            Self::Kind => "kind",
+            Self::ProxyIds => "proxy_ids",
+            Self::DisabledProxyIds => "disabled_proxy_ids",
+            Self::RedundancyTimeout => "redundancy_timeout",
+            Self::RedundancyTryDirect => "redundancy_try_direct",
+            Self::RedundancyRecheck => "redundancy_recheck",
+            Self::RedundancyRecheckTime => "redundancy_recheck_time",
+            Self::LoadBalancingSameProxyForPid => "load_balancing_same_proxy_for_pid",
+        }
+    }
+
+    fn value_schema(self) -> Value {
+        match self {
+            Self::Name => json!({ "type": "string", "minLength": 1 }),
+            Self::Kind => json!({
+                "type": "string",
+                "enum": ["simple", "redundancy", "load_balancing"]
+            }),
+            Self::ProxyIds | Self::DisabledProxyIds => json!({
+                "type": "array",
+                "items": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+                "uniqueItems": true
+            }),
+            Self::RedundancyTimeout => {
+                json!({ "type": "integer", "minimum": 1, "maximum": 9999 })
+            }
+            Self::RedundancyRecheckTime => {
+                json!({ "type": "integer", "minimum": 1, "maximum": 4294967295_u64 })
+            }
+            _ => json!({ "type": "boolean" }),
+        }
+    }
+
+    fn value(self, chain: &proxsep_core::profile::Chain) -> Value {
+        match self {
+            Self::Name => json!(chain.name),
+            Self::Kind => json!(chain.kind),
+            Self::ProxyIds => json!(chain.proxy_ids),
+            Self::DisabledProxyIds => json!(chain.disabled_proxy_ids),
+            Self::RedundancyTimeout => json!(chain.redundancy_timeout),
+            Self::RedundancyTryDirect => json!(chain.redundancy_try_direct),
+            Self::RedundancyRecheck => json!(chain.redundancy_recheck),
+            Self::RedundancyRecheckTime => json!(chain.redundancy_recheck_time),
+            Self::LoadBalancingSameProxyForPid => {
+                json!(chain.load_balancing_same_proxy_for_pid)
+            }
+        }
+    }
+
+    fn set(
+        self,
+        chain: &mut proxsep_core::profile::Chain,
+        value: Value,
+    ) -> Result<(), CommandError> {
+        let invalid_type = || {
+            CommandError::InvalidArguments(format!(
+                "value for chain.{} has the wrong type or range",
+                self.id()
+            ))
+        };
+        match self {
+            Self::Name => chain.name = value.as_str().ok_or_else(invalid_type)?.to_owned(),
+            Self::Kind => {
+                let kind = value.as_str().ok_or_else(invalid_type)?;
+                if !["simple", "redundancy", "load_balancing"].contains(&kind) {
+                    return Err(invalid_type());
+                }
+                chain.kind = kind.to_owned();
+            }
+            Self::ProxyIds => chain.proxy_ids = id_array(value, self.id())?,
+            Self::DisabledProxyIds => chain.disabled_proxy_ids = id_array(value, self.id())?,
+            Self::RedundancyTimeout => {
+                chain.redundancy_timeout = value
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| (1..=9999).contains(value))
+                    .ok_or_else(invalid_type)?
+            }
+            Self::RedundancyTryDirect => {
+                chain.redundancy_try_direct = value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::RedundancyRecheck => {
+                chain.redundancy_recheck = value.as_bool().ok_or_else(invalid_type)?
+            }
+            Self::RedundancyRecheckTime => {
+                chain.redundancy_recheck_time = value
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value != 0)
+                    .ok_or_else(invalid_type)?
+            }
+            Self::LoadBalancingSameProxyForPid => {
+                chain.load_balancing_same_proxy_for_pid =
+                    value.as_bool().ok_or_else(invalid_type)?
+            }
+        }
+        Ok(())
+    }
+}
 
 impl ProxyField {
     fn id(self) -> &'static str {
@@ -365,6 +496,8 @@ enum CommandHandler {
     ProfileOptionSet(ProfileOptionField),
     ProxyFieldGet(ProxyField),
     ProxyFieldSet(ProxyField),
+    ChainFieldGet(ChainField),
+    ChainFieldSet(ChainField),
 }
 
 struct RegisteredCommand {
@@ -570,6 +703,238 @@ impl CommandRegistry {
         }
         registry.register(
             descriptor(
+                "proxy.protocol.list",
+                "proxy",
+                "List supported proxy protocols",
+                CommandRisk::ReadOnly,
+                empty_schema(),
+                schema("array"),
+            ),
+            proxy_protocol_list,
+        );
+        registry.register(
+            descriptor(
+                "proxy.create",
+                "proxy",
+                "Create a validated proxy without implicit credentials",
+                CommandRisk::Mutating,
+                proxy_create_schema(),
+                schema("object"),
+            ),
+            proxy_create,
+        );
+        for (id, summary, risk, input_schema, handler) in [
+            (
+                "proxy.delete",
+                "Delete an unreferenced proxy",
+                CommandRisk::Mutating,
+                profile_id_schema(),
+                proxy_delete as Handler,
+            ),
+            (
+                "proxy.duplicate",
+                "Duplicate a proxy without copying credentials",
+                CommandRisk::Mutating,
+                profile_id_schema(),
+                proxy_duplicate as Handler,
+            ),
+            (
+                "proxy.endpoint.get",
+                "Read a proxy network endpoint",
+                CommandRisk::ReadOnly,
+                profile_id_schema(),
+                proxy_endpoint_get as Handler,
+            ),
+            (
+                "proxy.endpoint.set",
+                "Set a proxy network endpoint and return validated XML",
+                CommandRisk::Mutating,
+                proxy_endpoint_set_schema(),
+                proxy_endpoint_set as Handler,
+            ),
+            (
+                "proxy.credentials.status",
+                "Read credential presence and protection state without secret values",
+                CommandRisk::ReadOnly,
+                profile_id_schema(),
+                proxy_credentials_status as Handler,
+            ),
+            (
+                "proxy.credentials.set",
+                "Set proxy credentials using the profile credential backend",
+                CommandRisk::Mutating,
+                proxy_credentials_set_schema(),
+                proxy_credentials_set as Handler,
+            ),
+            (
+                "proxy.credentials.clear",
+                "Remove proxy credentials",
+                CommandRisk::Mutating,
+                profile_id_schema(),
+                proxy_credentials_clear as Handler,
+            ),
+        ] {
+            registry.register(
+                descriptor(id, "proxy", summary, risk, input_schema, schema("object")),
+                handler,
+            );
+        }
+        for (id, summary, handler) in [
+            (
+                "chain.list",
+                "List configured proxy chains",
+                chain_list as Handler,
+            ),
+            (
+                "chain.get",
+                "Read one configured proxy chain",
+                chain_get as Handler,
+            ),
+            (
+                "chain.count",
+                "Count configured proxy chains",
+                chain_count as Handler,
+            ),
+            (
+                "chain.id.next",
+                "Find the first available proxy or chain identifier",
+                chain_next_id as Handler,
+            ),
+            (
+                "chain.references",
+                "List rules that reference a proxy chain",
+                chain_references as Handler,
+            ),
+        ] {
+            let input_schema = match id {
+                "chain.get" | "chain.references" => profile_id_schema(),
+                _ => required_string_schema("xml"),
+            };
+            registry.register(
+                descriptor(
+                    id,
+                    "chain",
+                    summary,
+                    CommandRisk::ReadOnly,
+                    input_schema,
+                    schema(if id == "chain.list" {
+                        "array"
+                    } else {
+                        "object"
+                    }),
+                ),
+                handler,
+            );
+        }
+        for field in CHAIN_FIELDS {
+            let get_id = format!("chain.{}.get", field.id());
+            let set_id = format!("chain.{}.set", field.id());
+            registry.register_handler(
+                descriptor(
+                    &get_id,
+                    "chain",
+                    &format!("Read proxy-chain field {}", field.id()),
+                    CommandRisk::ReadOnly,
+                    profile_id_schema(),
+                    chain_field_output_schema(field, false),
+                ),
+                CommandHandler::ChainFieldGet(field),
+            );
+            registry.register_handler(
+                descriptor(
+                    &set_id,
+                    "chain",
+                    &format!(
+                        "Set proxy-chain field {} and return validated XML",
+                        field.id()
+                    ),
+                    CommandRisk::Mutating,
+                    chain_field_set_schema(field),
+                    chain_field_output_schema(field, true),
+                ),
+                CommandHandler::ChainFieldSet(field),
+            );
+        }
+        registry.register(
+            descriptor(
+                "chain.kind.list",
+                "chain",
+                "List supported proxy-chain selection kinds",
+                CommandRisk::ReadOnly,
+                empty_schema(),
+                schema("array"),
+            ),
+            chain_kind_list,
+        );
+        registry.register(
+            descriptor(
+                "chain.create",
+                "chain",
+                "Create a validated proxy chain",
+                CommandRisk::Mutating,
+                chain_create_schema(),
+                schema("object"),
+            ),
+            chain_create,
+        );
+        for (id, summary, input_schema, handler) in [
+            (
+                "chain.delete",
+                "Delete an unreferenced proxy chain",
+                profile_id_schema(),
+                chain_delete as Handler,
+            ),
+            (
+                "chain.duplicate",
+                "Duplicate a proxy chain under a fresh identifier",
+                profile_id_schema(),
+                chain_duplicate as Handler,
+            ),
+            (
+                "chain.member.add",
+                "Insert an enabled proxy-chain member",
+                chain_member_add_schema(),
+                chain_member_add as Handler,
+            ),
+            (
+                "chain.member.remove",
+                "Remove a proxy-chain member",
+                chain_member_schema(),
+                chain_member_remove as Handler,
+            ),
+            (
+                "chain.member.enable",
+                "Enable a proxy-chain member",
+                chain_member_schema(),
+                chain_member_enable as Handler,
+            ),
+            (
+                "chain.member.disable",
+                "Disable a proxy-chain member",
+                chain_member_schema(),
+                chain_member_disable as Handler,
+            ),
+            (
+                "chain.member.move",
+                "Move a proxy-chain member while preserving order",
+                chain_member_move_schema(),
+                chain_member_move as Handler,
+            ),
+        ] {
+            registry.register(
+                descriptor(
+                    id,
+                    "chain",
+                    summary,
+                    CommandRisk::Mutating,
+                    input_schema,
+                    schema("object"),
+                ),
+                handler,
+            );
+        }
+        registry.register(
+            descriptor(
                 "route.decide",
                 "route",
                 "Evaluate the winning rule for a connection",
@@ -727,6 +1092,8 @@ impl CommandRegistry {
             CommandHandler::ProfileOptionSet(field) => profile_option_set(*field, arguments),
             CommandHandler::ProxyFieldGet(field) => proxy_field_get(*field, arguments),
             CommandHandler::ProxyFieldSet(field) => proxy_field_set(*field, arguments),
+            CommandHandler::ChainFieldGet(field) => chain_field_get(*field, arguments),
+            CommandHandler::ChainFieldSet(field) => chain_field_set(*field, arguments),
         }
     }
 
@@ -755,6 +1122,7 @@ impl CommandRegistry {
                         CommandError::InvalidArguments(_) => "invalid_arguments",
                         CommandError::RuntimeRequired => "runtime_required",
                         CommandError::NotFound(_) => "not_found",
+                        CommandError::Conflict(_) => "conflict",
                         CommandError::Failed(_) => "command_failed",
                     }
                     .into(),
@@ -964,6 +1332,139 @@ fn proxy_field_output_schema(field: ProxyField, include_xml: bool) -> Value {
     })
 }
 
+fn chain_field_set_schema(field: ChainField) -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "id", "value"],
+        "properties": {
+            "xml": { "type": "string" },
+            "id": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+            "value": field.value_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn chain_field_output_schema(field: ChainField, include_xml: bool) -> Value {
+    let mut required = vec![json!("id"), json!("field"), json!("value")];
+    let mut properties = serde_json::Map::from_iter([
+        ("id".into(), json!({ "type": "integer" })),
+        (
+            "field".into(),
+            json!({ "type": "string", "const": field.id() }),
+        ),
+        ("value".into(), field.value_schema()),
+    ]);
+    if include_xml {
+        required.push(json!("xml"));
+        properties.insert("xml".into(), json!({ "type": "string" }));
+    }
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": properties,
+        "additionalProperties": false
+    })
+}
+
+fn proxy_create_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "protocol", "address", "port"],
+        "properties": {
+            "xml": { "type": "string" },
+            "id": { "type": ["integer", "null"], "minimum": 1, "maximum": 4294967295_u64 },
+            "protocol": { "type": "string", "enum": ["SOCKS4", "SOCKS4A", "SOCKS5", "HTTPS", "HTTP"] },
+            "address": { "type": "string", "minLength": 1 },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "label": { "type": "string" },
+            "user_agent": { "type": "string" },
+            "options": { "type": "integer", "minimum": 0, "maximum": 4294967295_u64 }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn proxy_endpoint_set_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "id", "address", "port"],
+        "properties": {
+            "xml": { "type": "string" },
+            "id": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+            "address": { "type": "string", "minLength": 1 },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn proxy_credentials_set_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "id", "username", "password"],
+        "properties": {
+            "xml": { "type": "string" },
+            "id": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+            "username": { "type": "string" },
+            "password": { "type": "string" }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn chain_create_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "name", "kind"],
+        "properties": {
+            "xml": { "type": "string" },
+            "id": { "type": ["integer", "null"], "minimum": 1, "maximum": 4294967295_u64 },
+            "name": { "type": "string", "minLength": 1 },
+            "kind": { "type": "string", "enum": ["simple", "redundancy", "load_balancing"] },
+            "proxy_ids": {
+                "type": "array",
+                "items": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+                "uniqueItems": true
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn chain_member_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "id", "proxy_id"],
+        "properties": {
+            "xml": { "type": "string" },
+            "id": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+            "proxy_id": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn chain_member_add_schema() -> Value {
+    let mut schema = chain_member_schema();
+    schema["properties"]["position"] = json!({ "type": ["integer", "null"], "minimum": 0 });
+    schema
+}
+
+fn chain_member_move_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["xml", "id", "from_index", "to_index"],
+        "properties": {
+            "xml": { "type": "string" },
+            "id": { "type": "integer", "minimum": 1, "maximum": 4294967295_u64 },
+            "from_index": { "type": "integer", "minimum": 0 },
+            "to_index": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmptyArguments {}
@@ -1004,6 +1505,80 @@ struct ProfileIdValueArguments {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ProxyCreateArguments {
+    xml: String,
+    #[serde(default)]
+    id: Option<u32>,
+    protocol: String,
+    address: String,
+    port: u16,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    user_agent: String,
+    #[serde(default)]
+    options: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyEndpointSetArguments {
+    xml: String,
+    id: u32,
+    address: String,
+    port: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProxyCredentialsSetArguments {
+    xml: String,
+    id: u32,
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChainCreateArguments {
+    xml: String,
+    #[serde(default)]
+    id: Option<u32>,
+    name: String,
+    kind: String,
+    #[serde(default)]
+    proxy_ids: Vec<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChainMemberArguments {
+    xml: String,
+    id: u32,
+    proxy_id: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChainMemberAddArguments {
+    xml: String,
+    id: u32,
+    proxy_id: u32,
+    #[serde(default)]
+    position: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChainMemberMoveArguments {
+    xml: String,
+    id: u32,
+    from_index: usize,
+    to_index: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RouteArguments {
     xml: String,
     application: String,
@@ -1037,6 +1612,18 @@ struct AvailabilityArguments {
 
 fn arguments<T: DeserializeOwned>(value: Value) -> Result<T, CommandError> {
     serde_json::from_value(value).map_err(|error| CommandError::InvalidArguments(error.to_string()))
+}
+
+fn id_array(value: Value, field: &str) -> Result<Vec<u32>, CommandError> {
+    let ids = serde_json::from_value::<Vec<u32>>(value)
+        .map_err(|error| CommandError::InvalidArguments(error.to_string()))?;
+    let mut unique = HashSet::new();
+    if ids.iter().any(|id| *id == 0 || !unique.insert(*id)) {
+        return Err(CommandError::InvalidArguments(format!(
+            "{field} must contain unique non-zero IDs"
+        )));
+    }
+    Ok(ids)
 }
 
 fn empty_object() -> Value {
@@ -1255,12 +1842,12 @@ fn set_encryption_mode(profile: &mut Profile, mode: &str) -> Result<(), CommandE
     }
 }
 
-fn profile_with_id(value: Value) -> Result<(Profile, u32), CommandError> {
+fn profile_with_id(value: Value, entity: &str) -> Result<(Profile, u32), CommandError> {
     let input: ProfileIdArguments = arguments(value)?;
     if input.id == 0 {
-        return Err(CommandError::InvalidArguments(
-            "proxy ID must be non-zero".into(),
-        ));
+        return Err(CommandError::InvalidArguments(format!(
+            "{entity} ID must be non-zero"
+        )));
     }
     Ok((profile(&input.xml)?, input.id))
 }
@@ -1295,7 +1882,7 @@ fn proxy_list(
 }
 
 fn proxy_get(_: &CommandRegistry, _: &CommandContext, value: Value) -> Result<Value, CommandError> {
-    let (profile, id) = profile_with_id(value)?;
+    let (profile, id) = profile_with_id(value, "proxy")?;
     profile
         .proxies
         .iter()
@@ -1320,15 +1907,7 @@ fn proxy_next_id(
 ) -> Result<Value, CommandError> {
     let input: ProfileArguments = arguments(value)?;
     let profile = profile(&input.xml)?;
-    let existing = profile
-        .proxies
-        .iter()
-        .map(|proxy| proxy.id)
-        .collect::<HashSet<_>>();
-    let id = (1..u32::MAX)
-        .find(|id| !existing.contains(id))
-        .ok_or_else(|| CommandError::Failed("no proxy identifier is available".into()))?;
-    Ok(json!({ "id": id }))
+    Ok(json!({ "id": next_object_id(&profile)? }))
 }
 
 fn proxy_references(
@@ -1336,7 +1915,7 @@ fn proxy_references(
     _: &CommandContext,
     value: Value,
 ) -> Result<Value, CommandError> {
-    let (profile, id) = profile_with_id(value)?;
+    let (profile, id) = profile_with_id(value, "proxy")?;
     if !profile.proxies.iter().any(|proxy| proxy.id == id) {
         return Err(CommandError::NotFound(format!("proxy {id}")));
     }
@@ -1359,7 +1938,7 @@ fn proxy_references(
 }
 
 fn proxy_field_get(field: ProxyField, value: Value) -> Result<Value, CommandError> {
-    let (profile, id) = profile_with_id(value)?;
+    let (profile, id) = profile_with_id(value, "proxy")?;
     let proxy = profile
         .proxies
         .iter()
@@ -1387,6 +1966,613 @@ fn proxy_field_set(field: ProxyField, value: Value) -> Result<Value, CommandErro
         .to_xml()
         .map_err(|error| CommandError::Failed(error.to_string()))?;
     Ok(json!({ "id": input.id, "field": field.id(), "value": value, "xml": xml }))
+}
+
+fn validated_profile_xml(profile: &Profile) -> Result<String, CommandError> {
+    profile
+        .validate()
+        .map_err(|error| CommandError::InvalidArguments(error.to_string()))?;
+    profile
+        .to_xml()
+        .map_err(|error| CommandError::Failed(error.to_string()))
+}
+
+fn proxy_protocol_list(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    no_arguments(value)?;
+    Ok(json!(["SOCKS4", "SOCKS4A", "SOCKS5", "HTTPS", "HTTP"]))
+}
+
+fn proxy_create(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProxyCreateArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let id = input.id.unwrap_or(next_object_id(&profile)?);
+    if id == 0 {
+        return Err(CommandError::InvalidArguments(
+            "proxy ID must be non-zero".into(),
+        ));
+    }
+    if profile.proxies.iter().any(|proxy| proxy.id == id)
+        || profile.chains.iter().any(|chain| chain.id == id)
+    {
+        return Err(CommandError::Conflict(format!(
+            "proxy or chain ID {id} already exists"
+        )));
+    }
+    let proxy = proxsep_core::profile::Proxy {
+        id,
+        protocol: input.protocol,
+        address: input.address,
+        port: input.port,
+        username: None,
+        password: None,
+        label: input.label,
+        user_agent: input.user_agent,
+        options: input.options,
+    };
+    profile.proxies.push(proxy);
+    let xml = validated_profile_xml(&profile)?;
+    Ok(json!({ "proxy": proxy_value(&profile.proxies[profile.proxies.len() - 1]), "xml": xml }))
+}
+
+fn proxy_delete(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let (mut profile, id) = profile_with_id(value, "proxy")?;
+    let index = profile
+        .proxies
+        .iter()
+        .position(|proxy| proxy.id == id)
+        .ok_or_else(|| CommandError::NotFound(format!("proxy {id}")))?;
+    let chain_names = profile
+        .chains
+        .iter()
+        .filter(|chain| chain.proxy_ids.contains(&id))
+        .map(|chain| chain.name.as_str())
+        .collect::<Vec<_>>();
+    let rule_names = profile
+        .rules
+        .iter()
+        .filter(|rule| {
+            matches!(&rule.action, Action::Proxy(action_id) if action_id.parse::<u32>().ok() == Some(id))
+        })
+        .map(|rule| rule.name.as_str())
+        .collect::<Vec<_>>();
+    if !chain_names.is_empty() || !rule_names.is_empty() {
+        return Err(CommandError::Conflict(format!(
+            "proxy {id} is referenced by chains [{}] or rules [{}]",
+            chain_names.join(", "),
+            rule_names.join(", ")
+        )));
+    }
+    let deleted = profile.proxies.remove(index);
+    let xml = validated_profile_xml(&profile)?;
+    Ok(json!({ "deleted": proxy_value(&deleted), "xml": xml }))
+}
+
+fn proxy_duplicate(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let (mut profile, id) = profile_with_id(value, "proxy")?;
+    let mut duplicate = profile
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == id)
+        .cloned()
+        .ok_or_else(|| CommandError::NotFound(format!("proxy {id}")))?;
+    duplicate.id = next_object_id(&profile)?;
+    duplicate.username = None;
+    duplicate.password = None;
+    if !duplicate.label.is_empty() {
+        duplicate.label.push_str(" Copy");
+    }
+    profile.proxies.push(duplicate);
+    let created = proxy_value(&profile.proxies[profile.proxies.len() - 1]);
+    let xml = validated_profile_xml(&profile)?;
+    Ok(json!({ "proxy": created, "credentials_copied": false, "xml": xml }))
+}
+
+fn proxy_endpoint_get(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let (profile, id) = profile_with_id(value, "proxy")?;
+    let proxy = profile
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == id)
+        .ok_or_else(|| CommandError::NotFound(format!("proxy {id}")))?;
+    Ok(json!({ "id": id, "address": proxy.address, "port": proxy.port }))
+}
+
+fn proxy_endpoint_set(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProxyEndpointSetArguments = arguments(value)?;
+    if input.id == 0 || input.address.trim().is_empty() || input.port == 0 {
+        return Err(CommandError::InvalidArguments(
+            "endpoint requires a non-zero ID and port plus a non-empty address".into(),
+        ));
+    }
+    let mut profile = profile(&input.xml)?;
+    let proxy = profile
+        .proxies
+        .iter_mut()
+        .find(|proxy| proxy.id == input.id)
+        .ok_or_else(|| CommandError::NotFound(format!("proxy {}", input.id)))?;
+    proxy.address = input.address;
+    proxy.port = input.port;
+    let address = proxy.address.clone();
+    let port = proxy.port;
+    let xml = validated_profile_xml(&profile)?;
+    Ok(json!({ "id": input.id, "address": address, "port": port, "xml": xml }))
+}
+
+fn credential_status(profile: &Profile, id: u32) -> Result<Value, CommandError> {
+    let proxy = profile
+        .proxies
+        .iter()
+        .find(|proxy| proxy.id == id)
+        .ok_or_else(|| CommandError::NotFound(format!("proxy {id}")))?;
+    let password_protected = profile
+        .password_is_protected(proxy)
+        .map_err(|error| CommandError::Failed(error.to_string()))?;
+    Ok(json!({
+        "id": id,
+        "has_username": proxy.username.as_deref().is_some_and(|value| !value.is_empty()),
+        "has_password": proxy.password.as_deref().is_some_and(|value| !value.is_empty()),
+        "password_protected": password_protected,
+        "encryption_mode": profile.options.encryption_mode
+    }))
+}
+
+fn proxy_credentials_status(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let (profile, id) = profile_with_id(value, "proxy")?;
+    credential_status(&profile, id)
+}
+
+fn proxy_credentials_set(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProxyCredentialsSetArguments = arguments(value)?;
+    if input.id == 0 {
+        return Err(CommandError::InvalidArguments(
+            "proxy ID must be non-zero".into(),
+        ));
+    }
+    let mut profile = profile(&input.xml)?;
+    let proxy = profile
+        .proxies
+        .iter_mut()
+        .find(|proxy| proxy.id == input.id)
+        .ok_or_else(|| CommandError::NotFound(format!("proxy {}", input.id)))?;
+    proxy.username = Some(input.username);
+    proxy.password = Some(input.password);
+    let xml = validated_profile_xml(&profile)?;
+    let mut result = credential_status(&profile, input.id)?;
+    result["xml"] = Value::String(xml);
+    Ok(result)
+}
+
+fn proxy_credentials_clear(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let (mut profile, id) = profile_with_id(value, "proxy")?;
+    let proxy = profile
+        .proxies
+        .iter_mut()
+        .find(|proxy| proxy.id == id)
+        .ok_or_else(|| CommandError::NotFound(format!("proxy {id}")))?;
+    proxy.username = None;
+    proxy.password = None;
+    let xml = validated_profile_xml(&profile)?;
+    let mut result = credential_status(&profile, id)?;
+    result["xml"] = Value::String(xml);
+    Ok(result)
+}
+
+fn next_object_id(profile: &Profile) -> Result<u32, CommandError> {
+    let existing = profile
+        .proxies
+        .iter()
+        .map(|proxy| proxy.id)
+        .chain(profile.chains.iter().map(|chain| chain.id))
+        .collect::<HashSet<_>>();
+    (1..u32::MAX)
+        .find(|id| !existing.contains(id))
+        .ok_or_else(|| CommandError::Failed("no proxy or chain identifier is available".into()))
+}
+
+fn chain_value(chain: &proxsep_core::profile::Chain) -> Value {
+    json!({
+        "id": chain.id,
+        "name": chain.name,
+        "kind": chain.kind,
+        "proxy_ids": chain.proxy_ids,
+        "disabled_proxy_ids": chain.disabled_proxy_ids,
+        "redundancy_timeout": chain.redundancy_timeout,
+        "redundancy_try_direct": chain.redundancy_try_direct,
+        "redundancy_recheck": chain.redundancy_recheck,
+        "redundancy_recheck_time": chain.redundancy_recheck_time,
+        "load_balancing_same_proxy_for_pid": chain.load_balancing_same_proxy_for_pid
+    })
+}
+
+fn chain_list(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProfileArguments = arguments(value)?;
+    Ok(Value::Array(
+        profile(&input.xml)?
+            .chains
+            .iter()
+            .map(chain_value)
+            .collect(),
+    ))
+}
+
+fn chain_get(_: &CommandRegistry, _: &CommandContext, value: Value) -> Result<Value, CommandError> {
+    let (profile, id) = profile_with_id(value, "chain")?;
+    profile
+        .chains
+        .iter()
+        .find(|chain| chain.id == id)
+        .map(chain_value)
+        .ok_or_else(|| CommandError::NotFound(format!("chain {id}")))
+}
+
+fn chain_count(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProfileArguments = arguments(value)?;
+    Ok(json!({ "count": profile(&input.xml)?.chains.len() }))
+}
+
+fn chain_next_id(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ProfileArguments = arguments(value)?;
+    let profile = profile(&input.xml)?;
+    Ok(json!({ "id": next_object_id(&profile)? }))
+}
+
+fn chain_references(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let (profile, id) = profile_with_id(value, "chain")?;
+    if !profile.chains.iter().any(|chain| chain.id == id) {
+        return Err(CommandError::NotFound(format!("chain {id}")));
+    }
+    let rules = profile
+        .rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| {
+            matches!(&rule.action, Action::Chain(action_id) if action_id.parse::<u32>().ok() == Some(id))
+        })
+        .map(|(index, rule)| json!({ "index": index, "name": rule.name }))
+        .collect::<Vec<_>>();
+    Ok(json!({ "id": id, "rules": rules }))
+}
+
+fn chain_field_get(field: ChainField, value: Value) -> Result<Value, CommandError> {
+    let (profile, id) = profile_with_id(value, "chain")?;
+    let chain = profile
+        .chains
+        .iter()
+        .find(|chain| chain.id == id)
+        .ok_or_else(|| CommandError::NotFound(format!("chain {id}")))?;
+    Ok(json!({ "id": id, "field": field.id(), "value": field.value(chain) }))
+}
+
+fn validate_chain_members(profile: &Profile, index: usize) -> Result<(), CommandError> {
+    let chain = &profile.chains[index];
+    let proxy_ids = profile
+        .proxies
+        .iter()
+        .map(|proxy| proxy.id)
+        .collect::<HashSet<_>>();
+    let unique_members = chain.proxy_ids.iter().copied().collect::<HashSet<_>>();
+    if unique_members.len() != chain.proxy_ids.len()
+        || chain
+            .proxy_ids
+            .iter()
+            .any(|id| *id == 0 || !proxy_ids.contains(id))
+    {
+        return Err(CommandError::InvalidArguments(
+            "proxy_ids must contain unique IDs of configured proxies".into(),
+        ));
+    }
+    let unique_disabled = chain
+        .disabled_proxy_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    if unique_disabled.len() != chain.disabled_proxy_ids.len()
+        || chain
+            .disabled_proxy_ids
+            .iter()
+            .any(|id| !unique_members.contains(id))
+    {
+        return Err(CommandError::InvalidArguments(
+            "disabled_proxy_ids must be a unique subset of proxy_ids".into(),
+        ));
+    }
+    profile
+        .validate()
+        .map_err(|error| CommandError::InvalidArguments(error.to_string()))
+}
+
+fn chain_field_set(field: ChainField, value: Value) -> Result<Value, CommandError> {
+    let input: ProfileIdValueArguments = arguments(value)?;
+    if input.id == 0 {
+        return Err(CommandError::InvalidArguments(
+            "chain ID must be non-zero".into(),
+        ));
+    }
+    let mut profile = profile(&input.xml)?;
+    let index = profile
+        .chains
+        .iter()
+        .position(|chain| chain.id == input.id)
+        .ok_or_else(|| CommandError::NotFound(format!("chain {}", input.id)))?;
+    field.set(&mut profile.chains[index], input.value)?;
+    validate_chain_members(&profile, index)?;
+    let value = field.value(&profile.chains[index]);
+    let xml = profile
+        .to_xml()
+        .map_err(|error| CommandError::Failed(error.to_string()))?;
+    Ok(json!({ "id": input.id, "field": field.id(), "value": value, "xml": xml }))
+}
+
+fn chain_kind_list(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    no_arguments(value)?;
+    Ok(json!(["simple", "redundancy", "load_balancing"]))
+}
+
+fn chain_index(profile: &Profile, id: u32) -> Result<usize, CommandError> {
+    if id == 0 {
+        return Err(CommandError::InvalidArguments(
+            "chain ID must be non-zero".into(),
+        ));
+    }
+    profile
+        .chains
+        .iter()
+        .position(|chain| chain.id == id)
+        .ok_or_else(|| CommandError::NotFound(format!("chain {id}")))
+}
+
+fn chain_mutation_output(profile: &Profile, index: usize) -> Result<Value, CommandError> {
+    validate_chain_members(profile, index)?;
+    let chain = chain_value(&profile.chains[index]);
+    let xml = validated_profile_xml(profile)?;
+    Ok(json!({ "chain": chain, "xml": xml }))
+}
+
+fn chain_create(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ChainCreateArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let id = input.id.unwrap_or(next_object_id(&profile)?);
+    if id == 0 {
+        return Err(CommandError::InvalidArguments(
+            "chain ID must be non-zero".into(),
+        ));
+    }
+    if profile.proxies.iter().any(|proxy| proxy.id == id)
+        || profile.chains.iter().any(|chain| chain.id == id)
+    {
+        return Err(CommandError::Conflict(format!(
+            "proxy or chain ID {id} already exists"
+        )));
+    }
+    let proxy_ids = id_array(json!(input.proxy_ids), "proxy_ids")?;
+    let mut chain = proxsep_core::profile::Chain {
+        id,
+        name: input.name,
+        proxy_ids,
+        ..Default::default()
+    };
+    ChainField::Kind.set(&mut chain, json!(input.kind))?;
+    profile.chains.push(chain);
+    chain_mutation_output(&profile, profile.chains.len() - 1)
+}
+
+fn chain_delete(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let (mut profile, id) = profile_with_id(value, "chain")?;
+    let index = chain_index(&profile, id)?;
+    let rule_names = profile
+        .rules
+        .iter()
+        .filter(|rule| {
+            matches!(&rule.action, Action::Chain(action_id) if action_id.parse::<u32>().ok() == Some(id))
+        })
+        .map(|rule| rule.name.as_str())
+        .collect::<Vec<_>>();
+    if !rule_names.is_empty() {
+        return Err(CommandError::Conflict(format!(
+            "chain {id} is referenced by rules [{}]",
+            rule_names.join(", ")
+        )));
+    }
+    let deleted = profile.chains.remove(index);
+    let xml = validated_profile_xml(&profile)?;
+    Ok(json!({ "deleted": chain_value(&deleted), "xml": xml }))
+}
+
+fn chain_duplicate(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let (mut profile, id) = profile_with_id(value, "chain")?;
+    let index = chain_index(&profile, id)?;
+    let mut duplicate = profile.chains[index].clone();
+    duplicate.id = next_object_id(&profile)?;
+    duplicate.name.push_str(" Copy");
+    profile.chains.push(duplicate);
+    chain_mutation_output(&profile, profile.chains.len() - 1)
+}
+
+fn chain_member_add(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ChainMemberAddArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    if !profile
+        .proxies
+        .iter()
+        .any(|proxy| proxy.id == input.proxy_id)
+    {
+        return Err(CommandError::NotFound(format!("proxy {}", input.proxy_id)));
+    }
+    let index = chain_index(&profile, input.id)?;
+    let chain = &mut profile.chains[index];
+    if chain.proxy_ids.contains(&input.proxy_id) {
+        return Err(CommandError::Conflict(format!(
+            "proxy {} is already in chain {}",
+            input.proxy_id, input.id
+        )));
+    }
+    let position = input.position.unwrap_or(chain.proxy_ids.len());
+    if position > chain.proxy_ids.len() {
+        return Err(CommandError::InvalidArguments(
+            "member position is outside the chain".into(),
+        ));
+    }
+    chain.proxy_ids.insert(position, input.proxy_id);
+    chain
+        .disabled_proxy_ids
+        .retain(|proxy_id| *proxy_id != input.proxy_id);
+    chain_mutation_output(&profile, index)
+}
+
+fn chain_member_remove(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ChainMemberArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = chain_index(&profile, input.id)?;
+    let chain = &mut profile.chains[index];
+    let member_index = chain
+        .proxy_ids
+        .iter()
+        .position(|proxy_id| *proxy_id == input.proxy_id)
+        .ok_or_else(|| {
+            CommandError::NotFound(format!("proxy {} in chain {}", input.proxy_id, input.id))
+        })?;
+    chain.proxy_ids.remove(member_index);
+    chain
+        .disabled_proxy_ids
+        .retain(|proxy_id| *proxy_id != input.proxy_id);
+    chain_mutation_output(&profile, index)
+}
+
+fn chain_member_enable(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ChainMemberArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = chain_index(&profile, input.id)?;
+    let chain = &mut profile.chains[index];
+    if !chain.proxy_ids.contains(&input.proxy_id) {
+        return Err(CommandError::NotFound(format!(
+            "proxy {} in chain {}",
+            input.proxy_id, input.id
+        )));
+    }
+    chain
+        .disabled_proxy_ids
+        .retain(|proxy_id| *proxy_id != input.proxy_id);
+    chain_mutation_output(&profile, index)
+}
+
+fn chain_member_disable(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ChainMemberArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = chain_index(&profile, input.id)?;
+    let chain = &mut profile.chains[index];
+    if !chain.proxy_ids.contains(&input.proxy_id) {
+        return Err(CommandError::NotFound(format!(
+            "proxy {} in chain {}",
+            input.proxy_id, input.id
+        )));
+    }
+    if !chain.disabled_proxy_ids.contains(&input.proxy_id) {
+        chain.disabled_proxy_ids.push(input.proxy_id);
+    }
+    chain_mutation_output(&profile, index)
+}
+
+fn chain_member_move(
+    _: &CommandRegistry,
+    _: &CommandContext,
+    value: Value,
+) -> Result<Value, CommandError> {
+    let input: ChainMemberMoveArguments = arguments(value)?;
+    let mut profile = profile(&input.xml)?;
+    let index = chain_index(&profile, input.id)?;
+    let chain = &mut profile.chains[index];
+    if input.from_index >= chain.proxy_ids.len() || input.to_index >= chain.proxy_ids.len() {
+        return Err(CommandError::InvalidArguments(
+            "member move indices are outside the chain".into(),
+        ));
+    }
+    let proxy_id = chain.proxy_ids.remove(input.from_index);
+    chain.proxy_ids.insert(input.to_index, proxy_id);
+    chain_mutation_output(&profile, index)
 }
 
 fn connection(input: RouteArguments) -> Result<(Profile, Connection), CommandError> {
